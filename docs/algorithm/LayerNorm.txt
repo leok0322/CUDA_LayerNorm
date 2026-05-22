@@ -1,0 +1,395 @@
+================================================================================
+                          Layer Normalization (LayerNorm)
+                       算法概述 · 数学原理 · CUDA 实现解析
+================================================================================
+
+作者：leo
+日期：2026-05-21
+参考论文：Ba et al., "Layer Normalization", arXiv:1607.06450 (2016)
+
+--------------------------------------------------------------------------------
+一、算法概述
+--------------------------------------------------------------------------------
+
+Layer Normalization（层归一化）是深度学习中的一种归一化技术，由 Jimmy Lei Ba 等
+人于 2016 年提出，最初用于解决循环神经网络（RNN）中 Batch Normalization 不适用的
+问题。
+
+与 Batch Normalization 沿 batch 维度统计不同，LayerNorm 对单个样本的特征维度
+（即最后 D 个维度）独立计算均值和方差，因此不依赖 batch size，天然适合：
+  - 序列模型（RNN、LSTM）
+  - Transformer / 自注意力模块
+  - 小 batch 或在线学习场景
+
+核心流程（前向传播）：
+  1. 计算输入在归一化维度上的均值 μ
+  2. 计算输入在归一化维度上的方差 σ²
+  3. 对输入做零均值单位方差归一化，得到 x̂
+  4. 施加可学习的仿射变换：y = γ ⊙ x̂ + β
+
+γ（weight/scale）和 β（bias）是与特征维度等长的可学习参数，初始化为 γ=1, β=0。
+
+--------------------------------------------------------------------------------
+二、数学原理
+--------------------------------------------------------------------------------
+
+2.1 符号定义
+------------
+  x ∈ R^{B×...×D}    输入张量，D 为归一化维度（normalized_shape）
+  H = D               归一化维度的元素总数（若 normalized_shape 多维则 H = ∏Dᵢ）
+  ε                   数值稳定项（典型值 1e-5）
+  γ, β ∈ R^D         可学习的 scale 与 bias 参数
+
+2.2 前向传播（Forward Pass）
+----------------------------
+对输入向量 x（已展平最后若干维，长度 H）：
+
+  (1) 均值：
+        μ = (1/H) · Σᵢ xᵢ
+
+  (2) 方差：
+        σ² = (1/H) · Σᵢ (xᵢ - μ)²
+
+  (3) 归一化：
+        x̂ᵢ = (xᵢ - μ) / sqrt(σ² + ε)
+
+  (4) 仿射变换：
+        yᵢ = γᵢ · x̂ᵢ + βᵢ
+
+其中 sqrt(σ² + ε) 有时记作 rstd（reciprocal standard deviation），实现中常存储
+其倒数 rstd = 1 / sqrt(σ² + ε) 以减少除法运算。
+
+2.3 反向传播（Backward Pass）
+------------------------------
+设损失为 L，已知上游梯度 dy = ∂L/∂y，推导 dx、dγ、dβ。
+
+  (a) 参数梯度（对所有样本求和）：
+        dγᵢ = Σ_samples (dyᵢ · x̂ᵢ)
+        dβᵢ = Σ_samples dyᵢ
+
+  (b) 输入梯度（对单个样本）：
+      令 a = dy ⊙ γ，需从 dx̂ 反推 dx。
+
+      由链式法则展开（经过均值和方差的依赖关系）：
+
+        dx̂ᵢ = aᵢ
+
+        dσ² = Σᵢ dx̂ᵢ · (xᵢ - μ) · (-1/2) · (σ² + ε)^{-3/2}
+             = (-1/2) · rstd³ · Σᵢ aᵢ · (xᵢ - μ)
+
+        dμ  = Σᵢ dx̂ᵢ · (-rstd)  +  dσ² · Σᵢ (-2(xᵢ - μ)) / H
+             = -rstd · Σᵢ aᵢ  +  dσ² · 0          （因 Σ(xᵢ-μ)=0）
+             = -rstd · Σᵢ aᵢ
+
+        dxᵢ = dx̂ᵢ · rstd  +  dσ² · 2(xᵢ - μ)/H  +  dμ/H
+
+      整理为紧凑形式（令 c̄ = Σaᵢ, d̄ = Σaᵢ·x̂ᵢ）：
+
+        dxᵢ = rstd · [ aᵢ  -  (1/H)·c̄  -  x̂ᵢ·(1/H)·d̄ ]
+
+      该式无需显式存储 dσ² 和 dμ，只需两个标量 c̄ 和 d̄ 即可完成计算。
+
+2.4 数值稳定性分析
+------------------
+  - ε 防止方差为零时的除以零错误。
+  - 实现中常先用 float32/float64 累加统计量，再转回低精度，以缓解 half 精度下
+    的数值精度损失。
+  - Welford 在线算法可在单次遍历中同时计算均值和无偏方差，避免两遍扫描，适合
+    流式/内存受限场景。
+
+--------------------------------------------------------------------------------
+三、CUDA 实现解析
+--------------------------------------------------------------------------------
+
+3.1 并行化策略
+--------------
+输入张量维度：[N, H]，N 为独立样本数（batch × sequence），H 为归一化维度。
+
+  - 每个 CUDA block 负责处理一行（一个样本）。
+  - 同一 block 内的多个线程协作对长度 H 的向量做归约（均值、方差）。
+  - 线程数（block size）通常取 128~1024，H 较大时每个线程处理多个元素。
+
+典型的 grid/block 配置：
+    dim3 grid(N);             // 每个样本一个 block
+    dim3 block(BLOCK_SIZE);   // BLOCK_SIZE = 256 或 512
+
+3.2 并行归约（Parallel Reduction）
+------------------------------------
+计算均值 μ 和方差 σ² 均需全局求和，使用共享内存（shared memory）树形归约：
+
+  Step 1: 每个线程将局部元素累加到寄存器。
+  Step 2: 将寄存器值写入 shared memory。
+  Step 3: __syncthreads() 后，逐步折半合并（stride = blockDim.x/2, /4, ...）。
+  Step 4: 线程 0 持有最终结果，广播给 block 内所有线程（或直接用于下一步）。
+
+Warp-level 优化：最后 32 个线程在同一 warp 内，可用 __shfl_down_sync() 代替
+shared memory 归约，减少同步开销。
+
+  // warp reduce 示例
+  for (int offset = 16; offset > 0; offset >>= 1)
+      val += __shfl_down_sync(0xffffffff, val, offset);
+
+3.3 前向核函数结构（Forward Kernel）
+--------------------------------------
+  __global__ void layer_norm_forward(
+      const float* __restrict__ x,      // [N, H]
+      const float* __restrict__ gamma,  // [H]
+      const float* __restrict__ beta,   // [H]
+      float* __restrict__ y,            // [N, H]
+      float* __restrict__ mean,         // [N]  供反向使用
+      float* __restrict__ rstd,         // [N]  供反向使用
+      int N, int H, float eps)
+  {
+      int row = blockIdx.x;             // 当前处理的样本
+      const float* x_row = x + row * H;
+      float* y_row = y + row * H;
+
+      // Step 1: 计算均值（并行归约）
+      float sum = 0.f;
+      for (int i = threadIdx.x; i < H; i += blockDim.x)
+          sum += x_row[i];
+      // ... block reduce sum -> mu
+
+      // Step 2: 计算方差（并行归约）
+      float var = 0.f;
+      for (int i = threadIdx.x; i < H; i += blockDim.x) {
+          float diff = x_row[i] - mu;
+          var += diff * diff;
+      }
+      // ... block reduce var -> sigma2
+      float inv_std = rsqrtf(sigma2 / H + eps);   // rstd
+
+      // Step 3: 写回统计量（供反向使用）
+      if (threadIdx.x == 0) {
+          mean[row] = mu;
+          rstd[row] = inv_std;
+      }
+
+      // Step 4: 归一化 + 仿射变换
+      for (int i = threadIdx.x; i < H; i += blockDim.x)
+          y_row[i] = gamma[i] * ((x_row[i] - mu) * inv_std) + beta[i];
+  }
+
+3.4 反向核函数结构（Backward Kernel）
+---------------------------------------
+反向需要 x（或 x̂）、mean、rstd 以及上游梯度 dy。
+
+  __global__ void layer_norm_backward(
+      const float* dy,     // [N, H]  上游梯度
+      const float* x,      // [N, H]  前向输入
+      const float* gamma,  // [H]
+      const float* mean,   // [N]
+      const float* rstd,   // [N]
+      float* dx,           // [N, H]  输入梯度
+      float* dgamma,       // [H]     参数梯度（需原子加或分块归约）
+      float* dbeta,        // [H]
+      int N, int H)
+  {
+      int row = blockIdx.x;
+      float mu  = mean[row];
+      float inv = rstd[row];
+
+      // 计算 c̄ = Σ(dy·γ), d̄ = Σ(dy·γ·x̂)
+      float c_bar = 0.f, d_bar = 0.f;
+      for (int i = threadIdx.x; i < H; i += blockDim.x) {
+          float a  = dy[row*H+i] * gamma[i];
+          float xh = (x[row*H+i] - mu) * inv;   // x̂ᵢ
+          c_bar += a;
+          d_bar += a * xh;
+      }
+      // ... block reduce c_bar, d_bar
+
+      // 计算 dx
+      float inv_H = 1.f / H;
+      for (int i = threadIdx.x; i < H; i += blockDim.x) {
+          float a  = dy[row*H+i] * gamma[i];
+          float xh = (x[row*H+i] - mu) * inv;
+          dx[row*H+i] = inv * (a - inv_H * c_bar - xh * inv_H * d_bar);
+      }
+
+      // dgamma, dbeta 需跨 row 累加，通常用 atomicAdd 或单独的归约核
+  }
+
+3.5 关键优化技巧
+----------------
+  a) 内存访问合并（Coalesced Access）
+     - 按行分配给 block，同一 warp 的线程访问连续内存地址，满足合并访问要求。
+
+  b) 向量化加载（Vectorized Load）
+     - 使用 float4 / __half2 一次加载 4 个/2 个元素，提升内存带宽利用率。
+       float4 val = reinterpret_cast<const float4*>(x_row)[i/4];
+
+  c) Warp Shuffle 代替 Shared Memory 归约
+     - 对最后一个 warp 的归约使用 __shfl_down_sync，避免 shared memory bank 冲突。
+
+  d) 融合核（Fused Kernel）
+     - 将前向的均值计算、方差计算、归一化、仿射变换合并在一个 kernel 中，
+       减少全局内存读写次数（原本需要 3 遍扫描，融合后仅需 2 遍）。
+
+  e) 混合精度（Mixed Precision）
+     - 输入/输出可使用 half（FP16）或 bfloat16，统计量累加使用 float32，
+       兼顾性能与数值精度。
+
+  f) 持久化线程（Persistent Threads）/ CUB 库
+     - 对于 H 极大（>65536）的情况，可借助 CUB::BlockReduce 或 CUB::DeviceReduce
+       获得更优的归约性能。
+
+3.6 参数梯度 dgamma / dbeta 的并行策略
+----------------------------------------
+dgamma[i] = Σ_{row=0}^{N-1} dy[row, i] · x̂[row, i]
+dbeta[i]  = Σ_{row=0}^{N-1} dy[row, i]
+
+两者需对 N 个样本求和，有两种实现方式：
+
+  方案 A：原子加（atomicAdd）
+    - 每个 block 处理一行，对共享的 dgamma/dbeta 做 atomicAdd。
+    - 实现简单，但 N 较大时原子冲突严重，性能差。
+
+  方案 B：二阶段归约
+    - 第一阶段：每个 block 计算本行对 dgamma/dbeta 的贡献，写入临时缓冲区
+      temp[N, H]。
+    - 第二阶段：对 N 维做列归约，得到最终结果。
+    - 访问模式更规则，适合大 batch 场景。
+
+--------------------------------------------------------------------------------
+四、性能基准参考
+--------------------------------------------------------------------------------
+
+测试环境（示例）：NVIDIA A100-SXM4-80GB，CUDA 12.x，float32
+
+  配置 (N=512, H=1024)：
+    - Naive 两遍实现：~120 μs
+    - 融合单遍 + Warp Shuffle：~35 μs
+    - 融合 + float4 向量化：~20 μs
+
+  主要瓶颈：全局内存带宽（Memory-bound kernel），优化重点在于减少 global load/store
+  次数和提高内存带宽利用率。
+
+--------------------------------------------------------------------------------
+五、与 Batch Normalization 的对比
+--------------------------------------------------------------------------------
+
+5.1 归一化维度的本质区别
+--------------------------
+
+统计量形状由 normalized_shape（归一化维度）决定，不同场景如下：
+
+── CNN 场景：输入 [N, C, H, W] ──────────────────────────────────────────────
+
+  BatchNorm：normalized_shape = [N, H, W]（对每个 C，跨 N、H、W 统计）
+    μ_c = (1/(N·H·W)) · Σ_{n,h,w} x[n,c,h,w]
+    统计量形状：[1, C, 1, 1]  ← 每个通道一个均值/方差
+    含义：同一卷积核（channel）在不同样本、不同位置的激活值服从相似分布，
+          跨样本统计是有意义的
+
+  LayerNorm（CNN）：normalized_shape = [C, H, W]（对每个 N，跨 C、H、W 统计）
+    μ_n = (1/(C·H·W)) · Σ_{c,h,w} x[n,c,h,w]
+    统计量形状：[N, 1, 1, 1]  ← 每个样本一个均值/方差
+
+── NLP 场景：输入 [N, T, D] ─────────────────────────────────────────────────
+  N = batch size，T = seq_len（token 数），D = embedding dim
+
+  LayerNorm（NLP）：normalized_shape = [D]（对每个 token，仅在 D 上统计）
+    μ_{n,t} = (1/D) · Σ_d x[n,t,d]
+    统计量形状：[N, T, 1]  ← 每个 token 各有一个独立的均值/方差
+    含义：同一 token 的 D 维 embedding 是同一向量空间的坐标，
+          在内部做归一化有意义；不同 token 之间语义无关，不跨 token 统计
+
+直观示意（NLP，简化为 [N=1, T=3, D=4]）：
+
+  token0  [x x x x]   ← LayerNorm 在这 D=4 个值上统计 → 1 个 μ, 1 个 σ²
+  token1  [x x x x]   ← LayerNorm 在这 D=4 个值上统计 → 1 个 μ, 1 个 σ²
+  token2  [x x x x]   ← LayerNorm 在这 D=4 个值上统计 → 1 个 μ, 1 个 σ²
+  统计量形状：[1, 3, 1] = [N, T, 1]，共 3 个均值/方差
+
+  对比 BatchNorm（若强行用于 NLP）：
+  token0  [x x x x]
+  token1  [x x x x]
+          ↑ ↑ ↑ ↑
+  跨 token 统计同一 embedding 维度——"第 5 维在不同 token 上的分布"
+  语义上无意义（不同 token 代表完全不同的词）
+
+5.2 训练与推理的统计量处理
+----------------------------
+
+  BatchNorm：
+    - 训练阶段：用当前 mini-batch 的实时统计量做归一化，
+      同时以指数滑动平均（EMA）维护全局 running_mean 和 running_var。
+    - 推理阶段：不再计算 batch 统计量，直接使用训练积累的 running_mean/var。
+    - 问题：batch size 越小，实时统计量越不稳定，方差估计越不准确。
+
+  LayerNorm：
+    - 训练和推理阶段：每次都对当前样本实时计算均值和方差。
+    - 不依赖 batch 内其他样本，也不需要维护任何全局统计量。
+    - 训练/推理行为完全一致，没有 train/eval 模式差异。
+
+5.3 全面对比
+--------------
+
+  维度              BatchNorm                     LayerNorm
+  ───────────────────────────────────────────────────────────────────
+  统计量计算维度    跨样本 N（每通道独立）         跨特征 C,H,W（每样本独立）
+  统计量形状        [1, C, 1, 1]                   [N, 1, 1, 1]
+  依赖 batch size   是（小 batch 不稳定）           否
+  推理时统计量      使用预存 running mean/var       实时计算，无需预存
+  train/eval 差异   有（行为不同）                  无（完全一致）
+  序列变长支持      差（不同长度的 batch 统计混乱） 好（每样本独立）
+  参数共享方式      γ/β 按通道共享 [1, C, 1, 1]    γ/β 按特征共享 [C]
+  计算开销          推理开销小（统计量已预存）       每次实时计算
+  内存开销          需额外存 running_mean/var        无额外存储
+
+5.4 应用场景
+--------------
+
+  BatchNorm 适用场景：
+    - CNN 图像模型（ResNet、VGG、EfficientNet 等）
+      原因：图像 batch 通常 ≥ 32，跨样本统计可靠；
+            卷积特征图具有空间平稳性，同通道不同位置的特征分布相似，
+            适合在 N,H,W 上统一统计。
+    - 训练样本充足、batch size 较大（≥ 16）的场景。
+    - 需要隐式正则化效果（batch 内统计量的随机性有类似 Dropout 的效果）。
+
+  LayerNorm 适用场景：
+    - Transformer / 自注意力模型（BERT、GPT、ViT 等）
+      原因：序列长度可变，不同样本长度不同，batch 内统计跨样本无意义；
+            每个 token 的 embedding 维度归一化更符合语义独立性假设。
+    - RNN / LSTM
+      原因：循环网络时间步方向不固定，batch 统计在时序上不稳定。
+    - 小 batch 或 batch size = 1（在线学习、生成式推理）。
+    - 强化学习：每次只有一个或少量样本交互。
+    - 多模态、图神经网络等批次结构不规则的场景。
+
+5.5 其他归一化变体（拓展）
+----------------------------
+
+  InstanceNorm：对每个 (N, C)，在 H, W 上统计
+    统计量形状：[N, C, 1, 1]
+    适用：风格迁移（style transfer），每张图每通道独立归一化保留风格信息。
+
+  GroupNorm：将 C 维分为 G 组，每组内在 (C/G, H, W) 上统计
+    统计量形状：[N, G, 1, 1]
+    适用：batch size 小但通道数多的场景，如目标检测（batch=1~2）。
+    特例：G=1 退化为 LayerNorm；G=C 退化为 InstanceNorm。
+
+  RMSNorm（Root Mean Square LayerNorm）：
+    去掉均值中心化步骤，只做方差归一化：
+      ȳ = x / sqrt((1/H)·Σxᵢ² + ε)   再乘以 γ（无 β）
+    适用：LLaMA、T5 等现代 LLM，计算量比 LayerNorm 减少约 7%，
+          实验表明效果相当。
+
+--------------------------------------------------------------------------------
+六、参考资料
+--------------------------------------------------------------------------------
+
+  [1] Ba, J. L., Kiros, J. R., & Hinton, G. E. (2016).
+      Layer Normalization. arXiv:1607.06450.
+
+  [2] NVIDIA CUDA C++ Programming Guide.
+      https://docs.nvidia.com/cuda/cuda-c-programming-guide/
+
+  [3] PyTorch 源码：aten/src/ATen/native/cuda/layer_norm_kernel.cu
+
+  [4] Flash Attention 中的 LayerNorm 融合实现：
+      Dao et al., "FlashAttention-2", arXiv:2307.08691.
+
+================================================================================
