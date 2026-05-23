@@ -152,6 +152,12 @@ M2 更新推导：
     M2_{k+1} = Σᵢ₌₁^{k+1} (xᵢ − mean_{k+1})²
 
     对前 k 项（令 eᵢ = xᵢ − mean_k）：
+      目标是计算 Σᵢ₌₁ᵏ (xᵢ − mean_{k+1})²，将括号内展开：
+        xᵢ − mean_{k+1}
+        = xᵢ − [mean_k + δ/(k+1)]     ← 代入 mean_{k+1} 的表达式
+        = (xᵢ − mean_k) − δ/(k+1)     ← 拆括号
+        = eᵢ − δ/(k+1)                ← 代入 eᵢ 的定义，mean_k 消掉
+
       Σᵢ₌₁ᵏ (eᵢ − δ/(k+1))²
     = Σeᵢ²  − 2·δ/(k+1)·Σeᵢ  +  k·(δ/(k+1))²
     = M2_k  − 0               +  k·δ²/(k+1)²      ← Σeᵢ = 0（均值定义）
@@ -198,6 +204,19 @@ M2 更新推导：
     组 b：n_b 个元素，mean_b，M2_b = Σⱼ∈b (xⱼ − mean_b)²
 
 合并均值（精确）：
+    合并后的均值 = 所有元素总和 ÷ 总个数（加权平均）：
+      mean_ab = (n_a·mean_a + n_b·mean_b) / (n_a + n_b)
+
+    令 δ = mean_b − mean_a，则 mean_b = mean_a + δ，代入化简：
+      mean_ab = (n_a·mean_a + n_b·(mean_a + δ)) / n_ab
+              = ((n_a + n_b)·mean_a + n_b·δ) / n_ab
+              = mean_a + δ·n_b / n_ab
+
+    直觉：δ·n_b/n_ab 是对 mean_a 的修正量——组 b 的均值比组 a 高了 δ，
+    但组 b 只占总数的 n_b/n_ab，所以合并均值只需向组 b 方向移动这个比例。
+    例：n_a=3, mean_a=2, n_b=1, mean_b=6
+        δ=4，mean_ab = 2 + 4×(1/4) = 3  验证：(2+2+2+6)/4 = 3  ✓
+
     n_ab    = n_a + n_b
     δ       = mean_b − mean_a
     mean_ab = mean_a + δ·n_b / n_ab

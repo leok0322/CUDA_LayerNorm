@@ -15,8 +15,16 @@ __global__ void LayerNorm_kernel_double_warp_reduction(const scalar_i totalRow, 
   scalar_i threadNum { blockDim.x };
 
   if (row < totalRow) {
-    // 分配静态SMEM
-    static_assert(BLOCK_SIZE / 32 == 32 && "block的线程需要覆盖完成的warp且刚好是32个warp，以便第二次warp树形规约");
+    // static_assert 和 __shared__ 数组大小均要求编译期常量：
+    //   static_assert(cond)：cond 必须在编译期可求值，否则编译报错
+    //   __shared__ T arr[N]：N 必须是编译期常量，CUDA 不支持动态大小的共享内存数组（VLA）
+    //     原因：编译器在编译期就需要确定每个 block 的 SMEM 布局，分配固定偏移
+    //
+    // threadNum = blockDim.x 是运行时变量：
+    //   blockDim 在 kernel 启动时由 host 传入，编译器无法在编译期知道其值
+    //   因此 __shared__ scalar_t reduction[threadNum / 32] 会编译报错
+    //   必须改用编译期已知的宏 BLOCK_SIZE（在 common.cuh 中定义为 1024）
+    static_assert(BLOCK_SIZE / 32 == 32, "block的线程需要覆盖完整的warp且刚好是32个warp，以便第二次warp树形规约");
     __shared__ scalar_t reduction[BLOCK_SIZE / 32];
     // 求均值
     scalar_t rowMean {};
@@ -45,7 +53,7 @@ __global__ void LayerNorm_kernel_double_warp_reduction(const scalar_i totalRow, 
       rowMean = reduction[threadIDX];
     }
 
-    __syncthreads();
+
 
     if (threadIDX < 32) {
       for (scalar_i i {16}; i>=1; i>>=1) {

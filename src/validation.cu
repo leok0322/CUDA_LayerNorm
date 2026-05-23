@@ -76,7 +76,7 @@ void run_kernel(const int kernel_num, const uint totalRow, const uint totalCol, 
         case 0:  run_LayerNorm_kernel_base(totalRow, totalCol, A, out, mean, rstd, weight, bias);  break;
         case 1:  run_LayerNorm_kernel_naive(totalRow, totalCol, A, out, mean, rstd, weight, bias); break;
         case 2:  run_LayerNorm_kernel_double_warp_reduction(totalRow, totalCol, A, out, mean, rstd, weight, bias); break;
-        case 3:  break;
+        case 3:  run_LayerNorm_kernel_welford_double_warp_reduction(totalRow, totalCol, A, out, mean, rstd, weight, bias);break;
         case 4:  break;
         case 5:  break;
         case 6:  break;
