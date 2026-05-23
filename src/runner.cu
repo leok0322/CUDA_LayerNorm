@@ -38,3 +38,13 @@ void run_LayerNorm_kernel_naive(const uint totalRow, const uint totalCol, const 
   cudaCheck(cudaGetLastError());
 }
 
+
+void run_LayerNorm_kernel_double_warp_reduction(const uint totalRow, const uint totalCol, float *A,
+                float *out, float* mean, float* rstd, const float* weight, const float* bias) {
+  dim3 grid(1, totalRow, 1);
+  dim3 block(BLOCK_SIZE, 1, 1);
+  assert(totalCol % 4 == 0 && "向量化加载不能完整覆盖所有列");
+  LayerNorm_kernel_double_warp_reduction<float, float4,uint><<<grid, block, 0, 0>>>(totalRow,totalCol,A,out,mean,rstd,weight,bias);
+  cudaCheck(cudaGetLastError());
+}
+

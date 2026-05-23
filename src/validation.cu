@@ -70,12 +70,12 @@ void print_matrix(const float *A, uint M, uint N, std::ofstream &fs) {
 // run_kernel：按 kernel_num 分发到对应的 softmax kernel 实现
 //   参数默认值只需在头文件的函数声明中写，不在定义处重复
 //   deviceIdx：目标 GPU 设备编号（多卡时使用）
-void run_kernel(const int kernel_num, const uint totalRow, const uint totalCol, const float *A,
+void run_kernel(const int kernel_num, const uint totalRow, const uint totalCol, float *A,
                 float *out, float* mean, float* rstd, const float* weight, const float* bias) {
     switch (kernel_num) {
         case 0:  run_LayerNorm_kernel_base(totalRow, totalCol, A, out, mean, rstd, weight, bias);  break;
         case 1:  run_LayerNorm_kernel_naive(totalRow, totalCol, A, out, mean, rstd, weight, bias); break;
-        case 2:  break;
+        case 2:  run_LayerNorm_kernel_double_warp_reduction(totalRow, totalCol, A, out, mean, rstd, weight, bias); break;
         case 3:  break;
         case 4:  break;
         case 5:  break;
@@ -283,10 +283,10 @@ int main(int argc, char **argv) {
                 fs.open(resultLogFile, std::ios::app);
             }
             // 以下写入是对同一个已打开流的顺序写入（写指针自动后移），与覆盖/追加模式无关
-            fs << "dimensions(m=n) " << m << "\n";
+            fs << "dimensions(m, n) " << m << ", " << n <<"\n";
             fs << std::fixed << std::setprecision(6)
                << "Average elapsed time: (" << elapsed_time / static_cast<float>(repeat_times) << ") s, performance: (";
-            fs << std::setprecision(1) << flops << ") GFLOPS. size: (" << m << ").\n";
+            fs << std::setprecision(1) << flops << ") GFLOPS. size: (" << m << ", " << n << ").\n";
 
         }
 
