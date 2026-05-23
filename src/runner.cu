@@ -74,3 +74,13 @@ void run_LayerNorm_kernel_welford_double_warp_reduction_unroll(const uint totalR
   LayerNorm_kernel_welford_double_warp_reduction_unroll<float, float4,uint><<<grid, block, 0, 0>>>(totalRow,totalCol,A,out,mean,rstd,weight,bias);
   cudaCheck(cudaGetLastError());
 }
+
+
+void run_LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const uint totalRow, const uint totalCol, float *A,
+                float *out, float* mean, float* rstd, float* weight, float* bias) {
+  dim3 grid(1, totalRow, 1);
+  dim3 block(BLOCK_SIZE, 1, 1);
+  assert(totalCol % 4 == 0 && "向量化加载不能完整覆盖所有列");
+  LayerNorm_kernel_double_warp_reduction_unroll_SMEM<float, float4,uint><<<grid, block, 0, 0>>>(totalRow,totalCol,A,out,mean,rstd,weight,bias);
+  cudaCheck(cudaGetLastError());
+}

@@ -6,5 +6,5 @@
 #include "kernels/3_LayerNorm_kernel_double_warp_reduction_unroll.cuh"
 #include "kernels/4_LayerNorm_kernel_welford_double_warp_reduction.cuh"
 #include "kernels/5_LayerNorm_kernel_welford_double_warp_reduction_unroll.cuh"
-
+#include "kernels/6_layerNorm_kernel_double_warp_redcuction_unroll_SMEM.cuh"
 

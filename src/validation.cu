@@ -71,7 +71,7 @@ void print_matrix(const float *A, uint M, uint N, std::ofstream &fs) {
 //   参数默认值只需在头文件的函数声明中写，不在定义处重复
 //   deviceIdx：目标 GPU 设备编号（多卡时使用）
 void run_kernel(const int kernel_num, const uint totalRow, const uint totalCol, float *A,
-                float *out, float* mean, float* rstd, const float* weight, const float* bias) {
+                float *out, float* mean, float* rstd, float* weight, float* bias) {
     switch (kernel_num) {
         case 0:  run_LayerNorm_kernel_base(totalRow, totalCol, A, out, mean, rstd, weight, bias);  break;
         case 1:  run_LayerNorm_kernel_naive(totalRow, totalCol, A, out, mean, rstd, weight, bias); break;
@@ -79,7 +79,7 @@ void run_kernel(const int kernel_num, const uint totalRow, const uint totalCol, 
         case 3:  run_LayerNorm_kernel_double_warp_reduction_unroll(totalRow, totalCol, A, out, mean, rstd, weight, bias);break;
         case 4:  run_LayerNorm_kernel_welford_double_warp_reduction(totalRow, totalCol, A, out, mean, rstd, weight, bias);break;
         case 5:  run_LayerNorm_kernel_welford_double_warp_reduction_unroll(totalRow, totalCol, A, out, mean, rstd, weight, bias);break;
-        case 6:  break;
+        case 6:  run_LayerNorm_kernel_double_warp_reduction_unroll_SMEM(totalRow, totalCol, A, out, mean, rstd, weight, bias); break;
         case 7:  break;
         case 8:  break;
         case 9:  break;
