@@ -14,7 +14,7 @@ LOG_DIR="logs"
 
 mkdir -p "$LOG_DIR"
 
-for i in $(seq 0 1); do
+for i in $(seq 3 3); do
     LOG_FILE="$LOG_DIR/kernel_${i}.log"
     echo "Running kernel ${i} → ${LOG_FILE}"
     # ── tee 方案：同时输出到 terminal 和文件 ────────────────────────────────

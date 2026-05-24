@@ -1,0 +1,132 @@
+================================================================================
+          CUDA Block 线程数限制 与 __shared__ 内存初始化约束
+================================================================================
+
+--------------------------------------------------------------------------------
+一、Block 线程数硬性限制
+--------------------------------------------------------------------------------
+
+CUDA 规定每个 block 的总线程数不得超过 1024：
+
+  blockDim.x × blockDim.y × blockDim.z ≤ 1024
+
+各维度还有独立上限：
+  blockDim.x ≤ 1024
+  blockDim.y ≤ 1024
+  blockDim.z ≤ 64
+
+1.1 为什么是硬性限制？
+────────────────────────
+一个 block 的所有线程必须同时驻留在同一个 SM（流式多处理器）上。
+SM 的 warp 调度槽数量有限：
+
+  Ampere / Ada 架构：每个 SM 最多同时驻留 32 warp × 32 线程 = 1024 线程
+
+超出限制时，cudaLaunchKernel 直接返回：
+  cudaErrorInvalidConfiguration（"invalid configuration argument"）
+
+1.2 查询当前设备的实际限制
+────────────────────────────
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, 0);
+  printf("maxThreadsPerBlock = %d\n", prop.maxThreadsPerBlock); // 通常为 1024
+
+1.3 典型错误案例
+────────────────
+  // BLOCK_SIZE_X = 1024，BLOCK_SIZE_Y = 4
+  dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y, 1); // 1024×4 = 4096 → 超限，启动失败
+
+  // 正确方式：保证总线程数 ≤ 1024
+  dim3 block(256, 4, 1);   // 256×4 = 1024 ✓
+  dim3 block(1024, 1, 1);  // 1024×1 = 1024 ✓
+
+1.4 运行时错误表现与定位
+─────────────────────────
+超出线程限制时，kernel 不会启动，cudaGetLastError() 返回错误码，
+配合 cudaCheck 宏会打印如下信息并中止程序：
+
+  [CUDA ERROR] at file src/runner.cu:90:
+  invalid configuration argument
+
+  → 错误发生在 cudaCheck(cudaGetLastError()) 处（kernel 启动的下一行）
+  → 说明 kernel 启动本身失败，而非 kernel 内部逻辑错误
+  → 向上检查传给 <<<grid, block>>> 的 dim3 参数，计算 blockDim.x×y×z
+
+定位步骤：
+  1. 找到报错行号对应的 cudaCheck，其上方即为 <<<...>>> 调用
+  2. 打印或计算 block 的总线程数：
+       printf("block = %d × %d × %d = %d\n",
+              block.x, block.y, block.z, block.x*block.y*block.z);
+  3. 确认总线程数 ≤ 1024，各维度满足上限
+
+本项目实际案例（kernel 6）：
+  BLOCK_SIZE_X_SMEM=128，BLOCK_SIZE_Y_SMEM=4 → 128×4=512 ✓（合法）
+  误用 BLOCK_SIZE_X=1024  +  BLOCK_SIZE_Y=4  → 1024×4=4096 ✗（触发此错误）
+
+--------------------------------------------------------------------------------
+二、__shared__ 内存不允许初始化器，初始内容是垃圾值
+--------------------------------------------------------------------------------
+
+2.1 规则
+─────────
+CUDA 编译器（nvcc）不允许对 __shared__ 变量使用任何初始化器：
+
+  __shared__ float arr[32] {};      // ❌ 编译报错：initializer not allowed
+  __shared__ float arr[32] = {0};   // ❌ 同样报错
+  __shared__ float arr[32];         // ✓ 只声明，不初始化
+
+2.2 为什么不能初始化？
+────────────────────────
+__shared__ 内存在每个 block 启动时由硬件分配，但没有自动清零或赋初值的机制。
+原因有二：
+
+  a. 硬件层面：CUDA 没有针对 SMEM 的批量初始化指令。
+     全局内存（__device__）可以在 kernel 启动前通过 cudaMemset 赋值，
+     但 SMEM 是 per-block 的临时存储，只能在 kernel 内部由线程手动写入。
+
+  b. 编译器层面：nvcc 无法为 __shared__ 变量生成初始化代码，
+     因为 SMEM 的生命周期与 block 绑定，不存在"程序启动时初始化"的时机。
+
+2.3 初始内容是垃圾值
+──────────────────────
+每个 block 启动时，__shared__ 内存的内容是未定义的（垃圾值）。
+这是因为 SM 上的 SMEM 可能被上一个已完成的 block 遗留的数据占用，
+硬件不负责清零，因此读取未写入的 SMEM 会得到不可预测的值。
+
+实际踩坑案例（kernel 6）：
+  reduction 数组只有 WARPS_PER_ROW=4 个槽，但第二阶段用 32 条 lane 读取：
+
+    if (threadIDX < 32) {
+        rowMean = reduction[threadIDX]; // ← slot 4..31 是垃圾值！
+    }
+
+  垃圾值被混入 XOR 归约，导致均值/方差偏差，输出与参考值相差约 0.1。
+
+2.4 正确的初始化方式
+──────────────────────
+在 kernel 内部由线程手动赋值：
+
+  // 方式一：每个线程写自己负责的槽
+  if (threadIdx.x < N) {
+      shared_arr[threadIdx.x] = 0.0f;
+  }
+  __syncthreads(); // 确保所有线程写完后再读
+
+  // 方式二：条件加载，越界 lane 直接赋 0，避免读垃圾值
+  float val = (threadIDX < WARPS_PER_ROW) ? reduction[threadIdx.y][threadIDX] : 0.0f;
+
+  方式二更高效：省去一次 __syncthreads()，适合第二阶段归约只需要部分槽的场景。
+
+--------------------------------------------------------------------------------
+三、两个约束的关联
+--------------------------------------------------------------------------------
+
+在 kernel 6（SMEM 多行版本）的设计中，两个约束同时出现：
+
+  1. BLOCK_SIZE_X_SMEM=128，BLOCK_SIZE_Y_SMEM=4 → 总线程 128×4=512 ≤ 1024 ✓
+     （如果误用 BLOCK_SIZE_X=1024 则 1024×4=4096，触发限制一）
+
+  2. reduction[WARPS_PER_ROW] 只有 4 槽，32 个 lane 读取时产生垃圾值
+     （触发限制二，必须用条件加载修复）
+
+================================================================================

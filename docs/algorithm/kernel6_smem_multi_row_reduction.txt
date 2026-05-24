@@ -1,0 +1,353 @@
+================================================================================
+  Kernel 6（LayerNorm_kernel_warp_reduction_unroll_SMEM）设计说明
+  ── BLOCK_SIZE_X_SMEM ≠ 1024 时的二级规约处理
+  ── BLOCK_SIZE_Y_SMEM ≠ 1 时的 SMEM 隔离处理
+  ── smemWeight / smemBias 的 bank conflict 分析与解决
+  ── 128-bit 合并指令的前提与 __align__(16) 的作用
+================================================================================
+
+背景：kernel 6 将每个 block 设计为同时处理多行（BLOCK_SIZE_Y_SMEM 行），
+      每行由 BLOCK_SIZE_X_SMEM 个线程协作，以提高 SM 占用率。
+      这与早期 kernel（BLOCK_SIZE_X=1024，blockDim.y=1）不同，
+      需要额外处理两类问题。
+
+--------------------------------------------------------------------------------
+一、BLOCK_SIZE_X_SMEM ≠ 1024 时的二级 warp 归约
+--------------------------------------------------------------------------------
+
+1.1 问题根源
+────────────
+warp 归约分两个阶段：
+
+  阶段 1：每行的每个 warp 在内部做 XOR 归约，lane 0 持有该 warp 的局部和，
+          写入 reduction[threadIdx.y][warp_id]，共 WARPS_PER_ROW 个槽。
+
+  阶段 2：用单个 warp（32 条 lane）对 WARPS_PER_ROW 个槽做最终归约。
+
+当 BLOCK_SIZE_X_SMEM = 1024 时，WARPS_PER_ROW = 1024/32 = 32，
+阶段 2 的 32 条 lane 恰好与 32 个槽一一对应，每条 lane 读一个有效槽，
+做 XOR 归约后 lane 0 得到全行和，无需特殊处理。
+
+当 BLOCK_SIZE_X_SMEM = 128 时，WARPS_PER_ROW = 128/32 = 4，
+只有 4 个有效槽，但阶段 2 仍然用 32 条 lane 做 XOR 归约。
+如果 lane 4..31 读取 reduction 数组中未写入的槽，会得到 SMEM 垃圾值，
+这些垃圾值被混入归约，导致均值/方差偏差（实测约 0.1）。
+
+1.2 修复方法
+────────────
+核心思路：XOR 蝶形归约是加法，lane 持有 0 不影响结果。
+只需在阶段 2 加载时，让越界 lane 持有 0，无需修改归约循环本身：
+
+  // 错误写法（lane 4..31 读垃圾值）：
+  if (threadIDX < 32) {
+      rowMean = reduction[threadIdx.y][threadIDX]; // slot 4..31 越界！
+  }
+
+  // 正确写法：越界 lane 条件性置 0
+  if (threadIDX < 32) {
+      rowMean = (threadIDX < WARPS_PER_ROW)
+                ? reduction[threadIdx.y][threadIDX]
+                : 0.0f; // 超出有效槽范围，不参与求和
+  }
+
+  // 归约循环保持不变（32-lane XOR），lane=0 持有 0 对结果无影响
+  if (threadIDX < 32) {
+      for (int i = 16; i >= 1; i >>= 1)
+          rowMean += __shfl_xor_sync(0xffffffff, rowMean, i, 32);
+  }
+
+1.3 为什么不需要手动只规约前 WARPS_PER_ROW 个 lane？
+──────────────────────────────────────────────────────
+XOR 归约每轮是"两两互换再相加"，lane 持有 0 时与其交换对象相加后
+对方值不变，本方值也不变（0+x=x），因此：
+
+  lane 4..31 = 0 时的归约过程（WARPS_PER_ROW=4 示例）：
+
+    offset=16: lane0 += lane16(=0)  → lane0 不变 ✓
+    offset=8:  lane0 += lane8(=0)   → lane0 不变 ✓
+    offset=4:  lane0 += lane4(=0)   → lane0 不变 ✓
+    offset=2:  lane0 += lane2       → lane0 = sum(0,2) ✓
+    offset=1:  lane0 += lane1       → lane0 = sum(0,1,2,3) ✓（正确全行和）
+
+  标准 32-lane XOR 自动退化为只对有效 lane 求和，无需额外分支。
+
+--------------------------------------------------------------------------------
+二、BLOCK_SIZE_Y_SMEM ≠ 1 时的 SMEM 隔离处理
+--------------------------------------------------------------------------------
+
+2.1 问题根源
+────────────
+当 blockDim.y > 1 时，同一 block 内有多行（多个 threadIdx.y）同时运行，
+它们共享同一块 SMEM。两类 SMEM 的访问模式完全不同：
+
+  ┌──────────────┬───────────────────────────────────────────────────────────┐
+  │ SMEM 变量     │ 访问方式                                                 │
+  ├──────────────┼───────────────────────────────────────────────────────────┤
+  │ smemWeight   │ 所有行共享同一份 weight，仅 threadIdx.y==0 写，其余行读 │
+  │ smemBias     │ 同上                                                      │
+  ├──────────────┼───────────────────────────────────────────────────────────┤
+  │ reduction    │ 每行有自己的局部和，必须按行隔离存储                     │
+  └──────────────┴───────────────────────────────────────────────────────────┘
+
+2.2 smemWeight / smemBias：安全共享
+─────────────────────────────────────
+weight 和 bias 对所有行都相同，因此多行共用同一份拷贝是正确且高效的：
+
+  写：仅 threadIdx.y == 0 的行写入，避免多行重复写相同内容
+  同步：__syncthreads() 保证 threadIdx.y==0 写完后，其余行才读取
+  读：所有行在归一化阶段均从 smemWeight/smemBias 读取，命中 SMEM 而非 GMEM
+
+  // threadIdx.y==0 写一次，所有行共享
+  if (threadIdx.y == 0) {
+      smemWeight[col * 4]     = vecWeight.x;
+      smemWeight[col * 4 + 1] = vecWeight.y;
+      ...
+  }
+  __syncthreads(); // ← 此屏障同时保证 smemWeight/smemBias 对所有行可见
+
+2.3 reduction：必须按行隔离
+──────────────────────────────
+每行的局部 warp 和不同，必须各自独立存储。
+
+  错误写法（一维，多行共用）：
+    __shared__ float reduction[WARPS_PER_ROW]; // 只有 4 个槽
+
+    // threadIdx.y=0 的 warp0 写 reduction[0]
+    // threadIdx.y=1 的 warp0 也写 reduction[0]  ← 数据竞争！
+    // __syncthreads() 后 reduction[0] 是最后写入的值，其他行的均值被覆盖
+    if (threadIDX % 32 == 0)
+        reduction[threadIDX / 32] = rowMean;
+
+  正确写法（二维，每行独占）：
+    __shared__ float reduction[BLOCK_SIZE_Y_SMEM][WARPS_PER_ROW]; // 4×4=16 槽
+
+    // 写：以 threadIdx.y 为行索引，互不干扰
+    if (threadIDX % 32 == 0)
+        reduction[threadIdx.y][threadIDX / 32] = rowMean;
+    __syncthreads();
+
+    // 读：每行只读自己的槽
+    rowMean = (threadIDX < WARPS_PER_ROW)
+              ? reduction[threadIdx.y][threadIDX]
+              : 0.0f;
+
+    // 最终结果回写也必须按行
+    if (threadIDX == 0)
+        reduction[threadIdx.y][0] = rowMean / totalCol;
+    __syncthreads();
+
+    rowMean = reduction[threadIdx.y][0]; // 每行读取自己的均值
+
+2.4 __syncthreads() 的覆盖范围
+────────────────────────────────
+__syncthreads() 是 block 级屏障，对 block 内所有线程（所有 threadIdx.y）生效。
+这意味着：
+  - smemWeight 由 threadIdx.y==0 写完后，__syncthreads() 确保所有行都能看到 ✓
+  - reduction 由各行分别写完后，__syncthreads() 确保所有行的写入都完成 ✓
+
+注意：不需要为每个 threadIdx.y 单独同步，一次 __syncthreads() 覆盖全部行。
+
+--------------------------------------------------------------------------------
+三、smemWeight / smemBias 的 bank conflict 分析
+--------------------------------------------------------------------------------
+
+3.1 SMEM bank 基础
+────────────────────
+CUDA SMEM 有 32 个 bank，每个 bank 宽 4 字节（sizeof(float)）。
+元素下标为 i 的 float 位于 bank = i % 32。
+同一 warp 内的多个线程若访问同一个 bank（但地址不同），就会发生 bank conflict，
+硬件将并行访问串行化，冲突度 k 意味着需要 k 个时钟周期完成。
+
+3.2 旧布局（一维数组）的 4-way bank conflict
+──────────────────────────────────────────────
+旧写法：__shared__ float smemWeight[MAX_TOTALCOL];
+
+  线程 t（col = t, 即每线程写一组 4 个元素）的起始下标 = t * 4
+  bank 编号 = (t * 4) % 32：
+
+    t=0  → bank 0
+    t=1  → bank 4
+    t=2  → bank 8
+    ...
+    t=7  → bank 28     （前 8 个线程分布在不同 bank，无冲突）
+    t=8  → bank (32) % 32 = bank 0  ← 与 t=0 冲突！
+    t=16 → bank 0      ← 再次冲突
+    t=24 → bank 0      ← 再次冲突
+
+  gcd(4, 32) = 4，步长 4 无法覆盖全部 32 个 bank，
+  每 32/4 = 8 个线程就会回绕到同一 bank，共 4 组线程争用 → 4-way bank conflict。
+
+3.3 解决方案：padding（步长改为 5）
+──────────────────────────────────────
+新写法：__shared__ float smemWeight[MAX_TOTALCOL / 4][5];
+访问：smemWeight[col][0..3]，其中 col = threadIdx.x（循环起始值）
+
+  关键点：warp 内每个线程 t 的 col 不相同。
+  循环以 col = threadIDX 起始，步长 = threadNum，因此第一次迭代时 col = t。
+  线程 t 写 smemWeight[t][0]，整体平坦下标 = t * 5。
+  bank 编号 = (t * 5) % 32：
+
+    t=0  → bank 0
+    t=1  → bank 5
+    t=2  → bank 10
+    t=3  → bank 15
+    t=4  → bank 20
+    t=5  → bank 25
+    t=6  → bank 30
+    t=7  → bank 3   （35 % 32）
+    ...（步长 5，每次偏移 5 个 bank）
+
+  gcd(5, 32) = 1 → 32 个线程产生 32 个不同 bank → 零 bank conflict ✓
+
+  为什么步长 5 更优于步长 4？
+    gcd(4, 32) = 4 → 只产生 32/4=8 个不同余数 → 4-way conflict
+    gcd(5, 32) = 1 → 产生 32   个不同余数 → 无 conflict
+  条件：步长与 bank 数（32 = 2⁵）互质，即步长为奇数即可（5 是最小的奇数填充）。
+
+  注意旧代码的 bug（已修复）：
+    错误：smemWeight[col * 4][0] — col 已是"第几组4元素"，再乘 4 最大达 4092，
+                                    远超数组第一维大小 1024，越界！
+    正确：smemWeight[col][0]     — col 范围 0..totalCol/4-1 = 0..1023 ✓
+
+3.3.1 越界的触发条件与错误现象
+──────────────────────────────────
+越界条件：
+  smemWeight 第一维大小 = MAX_TOTALCOL / 4 = 1024（有效下标 0..1023）。
+  错误写法 smemWeight[col * 4] 中，col 在循环第二次迭代时 = threadIDX + BLOCK_SIZE_X_SMEM。
+  对线程 t=0（threadIDX=0）：第二次迭代 col = BLOCK_SIZE_X_SMEM = 256，
+  col * 4 = 1024 → 越过有效上界 1023，触发越界。
+
+  触发的最小 totalCol：
+    循环步长 = BLOCK_SIZE_X_SMEM = 256，第二次迭代需要 col = 256 < totalCol / 4，
+    即 totalCol > 256 * 4 = 1024，最小触发值 totalCol = 2048。
+    → totalCol ∈ {128, 256, 512, 1024} 时不触发（最大 col*4 = 1020 < 1024）
+    → totalCol ≥ 2048 时必定触发（col*4 ≥ 1024 越界）
+
+错误现象：
+  CUDA 错误信息：an illegal memory access was encountered
+  报错位置：紧跟 kernel 启动的 cudaCheck（如 validation.cu:201），
+            因 CUDA 错误异步上报，kernel 内部越界在下一次 cudaCheck 才被捕获。
+  表现规律：totalCol = {128, 256, 512, 1024} 正常通过，totalCol = 2048 起崩溃。
+
+根本原因（2D 布局下误保留 1D 的 *4 乘法）：
+  原 1D 布局：__shared__ float smemWeight[MAX_TOTALCOL];
+              访问 smemWeight[col * 4]，因为一维索引需要展开成实际元素位置。
+  新 2D 布局：__shared__ float smemWeight[MAX_TOTALCOL / 4][5];
+              第一维 col 已是"第几组4元素"（范围 0..MAX_TOTALCOL/4-1），
+              第二维 [0..3] 表示组内4个分量，不需要再乘 4。
+              保留 * 4 是把 1D 的下标计算错误地搬入了 2D，导致第一维越界。
+
+3.4 gcd（最大公因数）与互质
+──────────────────────────────
+gcd（Greatest Common Divisor，最大公因数/最大公约数）：
+  两个整数 a 和 b 的所有公因数中最大的那个。
+
+  计算方法（辗转相除法）：
+    gcd(4, 32) = gcd(4, 32%4) = gcd(4, 0) = 4
+    gcd(5, 32) = gcd(5, 32%5) = gcd(5, 2) = gcd(2, 1) = gcd(1, 0) = 1
+
+  gcd = 1 时称 a 与 n 互质（coprime），即没有除 1 以外的公因数。
+
+  在 bank conflict 分析中，gcd(步长, 32) 决定冲突度：
+    gcd 值 k → 32 个线程只覆盖 32/k 个不同 bank → k-way conflict
+    gcd = 1  → 32 个线程覆盖 32 个不同 bank     → 零 conflict
+
+3.5 gcd 互质的数学原理
+──────────────────────
+命题：当 gcd(a, n) = 1 时，集合 {(a×t) mod n : t=0,1,...,n-1} 是 {0,...,n-1} 的排列。
+
+反证：若存在 t₁ ≠ t₂ 使得 a×t₁ ≡ a×t₂ (mod n)，
+      则 n | a(t₁-t₂)；因 gcd(a,n)=1，所以 n | (t₁-t₂)。
+      但 0 < |t₁-t₂| < n，矛盾。故 n 个值两两不同。
+
+  对 a=5, n=32：5 是奇数，32 = 2⁵，gcd(5,32)=1 ✓
+  → (t×5) % 32 对 t=0..31 产生 32 个不同值，覆盖所有 bank。
+
+--------------------------------------------------------------------------------
+四、128-bit 合并指令与 __align__(16) 的作用
+--------------------------------------------------------------------------------
+
+4.1 128-bit 合并 store 指令（st.shared.v4.f32）
+─────────────────────────────────────────────────
+编译器可将 4 次连续标量 store 合并为一条 128-bit 向量指令，条件：
+
+  1. 地址连续：4 次 store 依次写 [base], [base+1], [base+2], [base+3]，
+               中间无间隔（下标连续，步长 1）。
+
+  2. 16 字节对齐：绝对地址（基地址 + 字节偏移）必须是 16 的倍数。
+     旧一维布局：smemWeight[col*4] 的偏移 = col*4*4 = col*16（始终 16 的倍数 ✓）
+     新二维布局：smemWeight[col][0] 的偏移 = col*5*4 = col*20（gcd(20,16)=4，
+                 不总是 16 的倍数 ✗），因此新布局无法触发 128-bit 合并指令。
+
+  3. 编译器可静态验证：下标表达式在编译期可分析，编译器才能确认两个条件。
+
+合并的效果：4 条指令 → 1 条指令，减少指令流水压力（latency hiding 更高效）。
+注意：128-bit store 是单线程的优化，不影响多线程之间的 bank conflict。
+
+4.2 bank conflict 与 128-bit 合并的关系
+─────────────────────────────────────────
+两者是独立的概念：
+
+  ┌────────────────────────┬────────────────────────────────────────────────┐
+  │ 维度                    │ 说明                                          │
+  ├────────────────────────┼────────────────────────────────────────────────┤
+  │ bank conflict          │ 多线程之间争用同一 bank，硬件串行化            │
+  │ 128-bit 合并 store     │ 单线程内 4 次 store → 1 条指令，减少指令数    │
+  └────────────────────────┴────────────────────────────────────────────────┘
+
+  128-bit store 让单线程一次写 4 个连续元素（占 4 个 bank），
+  不能消除不同线程争用同一 bank 的冲突——4-way conflict 依然存在。
+
+  反之，padding 到步长 5 消除了 bank conflict，但同时破坏了 128-bit 合并的
+  16 字节对齐条件（col*20 字节偏移），因此是以放弃合并指令换取无 bank conflict 的权衡。
+
+4.3 __align__(16) 的作用
+──────────────────────────
+__align__(16) 只做一件事：令编译器把该 SMEM 变量的基地址放在 16 字节对齐的位置。
+不影响数组内部元素的布局，也不影响每次访问的偏移计算。
+
+  在当前文件中（新布局）：
+    smemWeight 的偏移 = col*20 字节（不总是 16 的倍数），
+    即使基地址 16 字节对齐，绝对地址依然不总对齐 → 对触发合并指令无帮助。
+
+  为什么还要保留 __align__(16)？
+    smemWeight 前方的 reduction[BLOCK_SIZE_Y_SMEM][32] 占
+    4 × 32 × 4 = 512 字节（512 是 16 的倍数），不写 __align__(16) 时
+    基地址也恰好 16 字节对齐，实际效果相同。
+    保留是防御性写法：若将来在 smemWeight 前插入奇数大小的 SMEM 变量，
+    __align__(16) 能防止基地址偏移破坏潜在的向量化对齐假设。
+
+--------------------------------------------------------------------------------
+五、SMEM 大小计算
+--------------------------------------------------------------------------------
+
+  WARPS_PER_ROW  = BLOCK_SIZE_X_SMEM / 32              （= 8，每行的 warp 数）
+  smemWeight     = (MAX_TOTALCOL/4) × 5 × sizeof(float) （= 4096/4×5×4 = 20 KB）
+  smemBias       = 同上                                  （= 20 KB）
+  reduction      = BLOCK_SIZE_Y_SMEM × 32 × sizeof(float)
+                 = 4 × 32 × 4 = 512 字节（极小）
+
+  总 SMEM = 20 + 20 + 0.5 ≈ 40.5 KB < 48 KB 默认上限，无需 cudaFuncSetAttribute。
+
+  注意：新布局 smemWeight[MAX_TOTALCOL/4][5] 比旧的一维布局多占用：
+    旧：MAX_TOTALCOL × 4 = 16 KB；新：MAX_TOTALCOL/4 × 5 × 4 = 20 KB
+    多 25%，是消除 bank conflict 的空间代价。
+
+--------------------------------------------------------------------------------
+六、设计总结
+--------------------------------------------------------------------------------
+
+  ┌───────────────────────────┬──────────────────────────────────────────────┐
+  │ 变量                      │ 设计策略                                    │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ smemWeight / smemBias     │ 共享（一写多读，__syncthreads 保序）        │
+  │ reduction[y][warp]        │ 隔离（二维，threadIdx.y 索引，无竞争）      │
+  │ 第二阶段归约 lane 4..31   │ 条件置 0（不读 SMEM，XOR 加 0 无副作用）   │
+  │ smemWeight/smemBias 布局  │ [N/4][5] padding，步长 5 与 32 互质 → 无冲 │
+  │ __align__(16)             │ 防御性基地址对齐，当前实际无差异           │
+  └───────────────────────────┴──────────────────────────────────────────────┘
+
+  权衡：padding 步长 5 消除 bank conflict，但破坏 16 字节对齐，
+        无法触发 128-bit 合并指令；需根据实际 profiling 决定哪种更优。
+
+================================================================================

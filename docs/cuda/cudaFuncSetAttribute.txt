@@ -1,0 +1,275 @@
+================================================================================
+  cudaFuncSetAttribute 完全说明
+  ── Ampere unified L1/SMEM 架构与三层 SMEM 概念
+  ── MaxDynamicSharedMemorySize 与 PreferredSharedMemoryCarveout
+  ── 函数签名与参数解析
+================================================================================
+
+--------------------------------------------------------------------------------
+一、核心概念：三层 SMEM 上限
+--------------------------------------------------------------------------------
+
+理解 cudaFuncSetAttribute 前，需要先区分三个独立的概念：
+
+  ┌────────────────────────┬──────────────┬─────────────────────────────────────┐
+  │ 概念                    │ 作用粒度     │ 说明                               │
+  ├────────────────────────┼──────────────┼─────────────────────────────────────┤
+  │ carveout               │ SM 级别      │ 硬件总量：SM 上所有 block 共享的    │
+  │                        │              │ SMEM 硬件池，影响同时驻留几个 block │
+  ├────────────────────────┼──────────────┼─────────────────────────────────────┤
+  │ per-block 软件上限      │ block 级别   │ 单个 block 能申请的最大 SMEM，      │
+  │（默认 48 KB）           │              │ 可通过 cudaFuncSetAttribute 提升    │
+  ├────────────────────────┼──────────────┼─────────────────────────────────────┤
+  │ 实际占用                │ block 级别   │ 静态 SMEM + 实际动态 SMEM，        │
+  │                        │              │ occupancy 计算的基准值              │
+  └────────────────────────┴──────────────┴─────────────────────────────────────┘
+
+  carveout 不限制单个 block 的用量，而是决定 SM 上能同时放几个 block（occupancy）。
+  per-block 软件上限决定单个 block 能不能启动。
+  实际占用决定 occupancy 的具体数值。
+
+1.1 Ampere unified L1/SMEM 架构（sm_86，如 RTX 3090）
+───────────────────────────────────────────────────────
+每个 SM 有 128 KB unified cache，在 L1 和 SMEM 之间灵活分配：
+
+  ┌──────────────────────────── 128 KB ────────────────────────────┐
+  │  SMEM carveout               │  L1 cache（其余部分）           │
+  └─────────────────────────────────────────────────────────────────┘
+
+  carveout 档位：8 / 16 / 32 / 64 / 100 KB（不连续，driver 在这几个值中选择）
+
+  常说的"默认 48 KB"不是 carveout 档位，而是 per-block 软件上限：
+    - driver 默认选择 64 KB carveout 档位
+    - 但同时将 per-block 软件上限锁定在 48 KB
+    - 即使硬件有 64 KB SMEM，不调用 cudaFuncSetAttribute 时 block 只能用 48 KB
+
+1.2 静态 SMEM 与动态 SMEM
+───────────────────────────
+  静态 SMEM：__shared__ 声明，编译期大小固定，kernel 启动时自动分配。
+  动态 SMEM：<<<grid, block, smem>>> 第3参数，每次启动时指定实际用量。
+
+  实际占用 = 静态 SMEM + 动态 SMEM（第3参数），两者共用同一 carveout 配额：
+    静态 + 动态 ≤ carveout
+
+  per-block 软件上限 = 静态 SMEM + MaxDynamicSharedMemorySize（申报的上限）
+
+1.2.1 per-block 软件上限与 MaxDynamic 的关系
+──────────────────────────────────────────────
+  per-block 软件上限直接由两项之和决定：
+
+    per-block 上限 = 静态 SMEM + MaxDynamic
+
+  默认上限 48 KB 的来源：
+    driver 默认将 MaxDynamic 设为 (48 KB - 静态 SMEM)，使上限恰好为 48 KB。
+    因此 "默认 48 KB" 并非固定值，而是随静态 SMEM 大小浮动的软限制。
+
+  常见设置模式：
+    ① 纯静态 kernel（动态 SMEM = 0）：
+         MaxDynamic = 0  →  上限 = 静态 SMEM（无需调用，默认 48 KB 已够）
+         若静态 SMEM > 48 KB，需设 MaxDynamic = 静态 - 48 KB 解除上限。
+
+    ② 对齐到某档位（如 kernel 6 当前做法）：
+         max_dynamic = 64*1024 - static_smem
+         上限 = 静态(40.5 KB) + MaxDynamic(23.5 KB) = 64 KB
+         同时 driver 选 64 KB 档位，carveout = 64 KB，L1 = 64 KB
+
+    ③ 动态 SMEM kernel（kernel 9）：
+         MaxDynamic = smem（实际动态用量）
+         上限 = 静态 + 实际动态 ≥ 实际占用，block 可以启动。
+
+  注意：MaxDynamic 是申报的上限，不是实际动态用量。
+        实际动态用量由 <<<grid, block, smem>>> 第3参数决定。
+        只要 实际动态 ≤ MaxDynamic，block 就能启动。
+
+1.3 三层关系示例（kernel 6）
+──────────────────────────────
+  静态 SMEM  = 40.5 KB（编译期固定）
+  动态 SMEM  = 0 KB（<<<>>> 第3参数为 0）
+  实际占用   = 40.5 + 0 = 40.5 KB       ← occupancy 计算基准
+  MaxDynamic = 23.5 KB（runner.cu 中 64*1024 - static_smem）
+  per-block 软件上限 = 40.5 + 23.5 = 64 KB（对齐到 64 KB 档位）
+  carveout   = 64 KB（driver 按静态 + MaxDynamic = 64 KB 选档）
+  occupancy  = floor(64 / 40.5) = 1 block/SM
+
+--------------------------------------------------------------------------------
+二、cudaFuncAttributeMaxDynamicSharedMemorySize
+--------------------------------------------------------------------------------
+
+2.1 作用
+──────────
+提升单个 block 的 per-block 软件上限（解除默认 48 KB 限制），同时触发 driver
+将 carveout 档位提升到能容纳 静态 + MaxDynamic 的最小档位。
+
+  修改的是：per-block 软件上限（block 能不能启动）
+  同时影响：carveout 选择（进而影响 occupancy）
+  不修改的是：实际占用（由实际动态 SMEM 决定）
+
+2.2 使用方式
+──────────────
+  // 动态 SMEM kernel（kernel 9，动态 SMEM = smem）：
+  size_t smem = (size_t)(2 + block_y) * totalCol * sizeof(float);
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+  kernel<<<grid, block, smem>>>(...);   // 实际动态 SMEM = smem
+
+  // 静态 SMEM kernel（kernel 6，动态 SMEM = 0）：
+  // MaxDynamic 只需设置静态超出 48 KB 的部分，其余时为 0
+  constexpr size_t static_smem = sizeof(float) * (BLOCK_SIZE_Y_SMEM * 32 + 2 * (MAX_TOTALCOL / 4) * 5);
+  constexpr size_t max_dynamic = static_smem > 48 * 1024 ? static_smem - 48 * 1024 : 0;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)max_dynamic);
+  kernel<<<grid, block, 0, 0>>>(...);   // 实际动态 SMEM = 0
+
+2.3 carveout 选择逻辑
+───────────────────────
+  driver 根据 静态 SMEM + MaxDynamicSharedMemorySize 选最小够用档位：
+
+  carveout 选择基准 = 静态 SMEM + MaxDynamic（最坏情况下 block 的总需求）
+
+  kernel 6 正确做法（动态 SMEM = 0）：
+    MaxDynamic = 0
+    静态(40.5 KB) + MaxDynamic(0) = 40.5 KB → 选 64 KB 档位
+    实际占用 = 40.5 KB，occupancy = floor(64 / 40.5) = 1 block/SM，L1 = 64 KB ✓
+
+  错误做法（MaxDynamic 设为静态 SMEM 大小）：
+    MaxDynamic = 40.5 KB
+    静态(40.5 KB) + MaxDynamic(40.5 KB) = 81 KB → 选 100 KB 档位
+    实际占用仍为 40.5 KB，carveout 浪费，L1 从 64 KB 缩至 28 KB ✗
+
+  当静态 SMEM 超过 48 KB 时（MAX_TOTALCOL 增大后）：
+    per-block 软件上限默认 48 KB < 静态 SMEM → kernel 启动失败
+    需设置 MaxDynamic = 静态 SMEM - 48 KB，解除上限：
+      constexpr size_t max_dynamic = static_smem > 48*1024 ? static_smem - 48*1024 : 0;
+      cudaFuncSetAttribute(kernel, MaxDynamicSharedMemorySize, (int)max_dynamic);
+
+--------------------------------------------------------------------------------
+三、cudaFuncAttributePreferredSharedMemoryCarveout
+--------------------------------------------------------------------------------
+
+3.1 作用
+──────────
+直接指定期望的 carveout 比例（占 unified cache 百分比），是软偏好。
+不影响 per-block 软件上限，仅影响 L1/SMEM 的硬件分配比例。
+
+  取值：
+    cudaSharedmemCarveoutDefault   // 默认（carveout 64 KB，per-block 上限 48 KB）
+    cudaSharedmemCarveoutMaxL1     // 最小 SMEM，最大 L1（carveout = 8 KB）
+    cudaSharedmemCarveoutMaxShared // 最大 SMEM，最小 L1（carveout = 100 KB）
+    0~100                          // 直接指定百分比
+
+3.2 使用场景
+──────────────
+  SMEM 密集型 kernel（如 kernel 6）：
+    cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                         cudaSharedmemCarveoutMaxShared);
+    → carveout = 100 KB，occupancy 上限更高，L1 = 28 KB
+
+  访存密集型 kernel（大量 GMEM 随机访问）：
+    cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                         cudaSharedmemCarveoutMaxL1);
+    → L1 = 120 KB，GMEM 命中率更高，carveout = 8 KB
+
+--------------------------------------------------------------------------------
+四、两个属性的区别与同时设置
+--------------------------------------------------------------------------------
+
+4.1 区别
+──────────
+  ┌──────────────────────────────────┬──────────────┬──────────────────────────┐
+  │ 属性                              │ 约束强度     │ 修改的目标              │
+  ├──────────────────────────────────┼──────────────┼──────────────────────────┤
+  │ MaxDynamicSharedMemorySize       │ 硬约束       │ per-block 软件上限       │
+  │                                  │ driver 必须满足│ 同时触发 carveout 升档  │
+  ├──────────────────────────────────┼──────────────┼──────────────────────────┤
+  │ PreferredSharedMemoryCarveout    │ 软偏好       │ carveout 档位            │
+  │                                  │ driver 尽量满足│ 不影响 per-block 上限   │
+  └──────────────────────────────────┴──────────────┴──────────────────────────┘
+
+4.2 同时设置
+──────────────
+不冲突，driver 取两者中更大的 carveout 需求：
+
+  实际 carveout = max(基于(静态 + MaxDynamic)选择的最小档位, Preferred 指定的档位)
+
+  示例一（Preferred 更大，取 Preferred）：
+    静态 SMEM = 40.5 KB，MaxDynamic = 0
+    → 静态 + MaxDynamic = 40.5 KB → 最小档位 64 KB
+    PreferredSharedMemoryCarveout = MaxShared（100 KB）
+    实际 carveout = max(64, 100) = 100 KB，L1 = 28 KB
+    occupancy = floor(100 / 40.5) = 2 block/SM（比默认 1 block/SM 更高）
+
+  示例二（MaxDynamic 要求更大，Preferred 被忽略）：
+    静态 SMEM = 10 KB，MaxDynamic = 90 KB
+    → 静态 + MaxDynamic = 100 KB → 最小档位 100 KB
+    PreferredSharedMemoryCarveout = 50%（64 KB）→ 不够，被忽略
+    实际 carveout = max(100, 64) = 100 KB（强制满足 MaxDynamic 要求）
+
+--------------------------------------------------------------------------------
+五、函数签名与参数详解
+--------------------------------------------------------------------------------
+
+  cudaError_t cudaFuncSetAttribute(
+      const void*       func,   // 参数1：kernel 函数指针
+      cudaFuncAttribute attr,   // 参数2：要设置的属性
+      int               value   // 参数3：属性对应的值
+  )
+
+5.1 参数1：const void* func
+─────────────────────────────
+指向 kernel 函数的指针，必须加 (const void*) 强转：
+
+  // 模板 kernel（需先实例化）：
+  (const void*)LayerNorm_kernel_warp_reduction_unroll_SMEM<float, float4, uint>
+
+  // 非模板 kernel：
+  (const void*)my_kernel
+
+5.2 参数2：cudaFuncAttribute attr
+───────────────────────────────────
+  cudaFuncAttributeMaxDynamicSharedMemorySize  → value 是字节数
+  cudaFuncAttributePreferredSharedMemoryCarveout → value 是百分比（0~100）或枚举
+
+5.3 参数3：int value
+──────────────────────
+  value 是 int，传入 size_t 时需强转：
+    constexpr size_t smem = sizeof(float) * (...);
+    cudaFuncSetAttribute(kernel, attr, (int)smem);
+
+  size_t：C/C++ 标准的无符号整数类型，表示内存大小，sizeof 的返回类型。
+    typedef unsigned long      size_t;  // 64-bit Linux
+    typedef unsigned long long size_t;  // 64-bit Windows
+
+5.4 返回值与错误处理
+──────────────────────
+  建议用 cudaCheck 包裹：
+    cudaCheck(cudaFuncSetAttribute(...));
+
+  常见错误：
+    cudaErrorInvalidValue         ：value 超出设备支持范围
+    cudaErrorInvalidDeviceFunction：func 指针无效或未正确实例化
+
+5.5 设备 per-block SMEM 上限查询
+──────────────────────────────────
+per-block 软件上限不能超过设备硬件支持的最大值，否则返回 cudaErrorInvalidValue。
+
+  不同 GPU 的 per-block SMEM 上限（opt-in 模式）：
+  ┌──────────────────────┬──────────────────────────────────────────────────┐
+  │ GPU                  │ sharedMemPerBlockOptin（可通过 opt-in 使用的上限）│
+  ├──────────────────────┼──────────────────────────────────────────────────┤
+  │ sm_86（RTX 3060/3090）│ 99 KB = 101376 字节                             │
+  │ sm_80（A100）        │ 163 KB = 166912 字节                             │
+  │ sm_89（RTX 4090）    │ 99 KB = 101376 字节                             │
+  └──────────────────────┴──────────────────────────────────────────────────┘
+
+  注意：carveout 最大档位 = 100 KB（SM 总量），但 per-block 上限 = 99 KB（留 1 KB 给 driver）。
+  因此 static + MaxDynamic ≤ 99 KB，不能设为 100 KB，否则报 cudaErrorInvalidValue。
+
+  查询当前设备上限：
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    size_t max_opt_in = prop.sharedMemPerBlockOptin;  // 通常 sm_86 = 99 KB
+
+  安全写法（以 99 KB 为上限）：
+    constexpr size_t max_dynamic = static_smem < 99 * 1024 ? 99 * 1024 - static_smem : 0;
+    // per-block 上限 = static(40.5 KB) + MaxDynamic(58.5 KB) = 99 KB
+    // driver 选 100 KB 档位，occupancy = floor(100 / 40.5) = 2 block/SM
+
+================================================================================

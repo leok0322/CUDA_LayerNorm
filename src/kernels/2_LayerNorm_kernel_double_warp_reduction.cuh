@@ -24,8 +24,8 @@ __global__ void LayerNorm_kernel_double_warp_reduction(const scalar_i totalRow, 
     //   blockDim 在 kernel 启动时由 host 传入，编译器无法在编译期知道其值
     //   因此 __shared__ scalar_t reduction[threadNum / 32] 会编译报错
     //   必须改用编译期已知的宏 BLOCK_SIZE（在 common.cuh 中定义为 1024）
-    static_assert(BLOCK_SIZE / 32 == 32, "block的线程需要覆盖完整的warp且刚好是32个warp，以便第二次warp树形规约");
-    __shared__ scalar_t reduction[BLOCK_SIZE / 32];
+    static_assert(BLOCK_SIZE_X / 32 == 32, "block的线程需要覆盖完整的warp且刚好是32个warp，以便第二次warp树形规约");
+    __shared__ scalar_t reduction[BLOCK_SIZE_X / 32];
     // 求均值
     scalar_t rowMean {};
     //每个线程向量化加载

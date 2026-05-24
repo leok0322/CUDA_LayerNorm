@@ -79,11 +79,10 @@ void run_kernel(const int kernel_num, const uint totalRow, const uint totalCol, 
         case 3:  run_LayerNorm_kernel_double_warp_reduction_unroll(totalRow, totalCol, A, out, mean, rstd, weight, bias);break;
         case 4:  run_LayerNorm_kernel_welford_double_warp_reduction(totalRow, totalCol, A, out, mean, rstd, weight, bias);break;
         case 5:  run_LayerNorm_kernel_welford_double_warp_reduction_unroll(totalRow, totalCol, A, out, mean, rstd, weight, bias);break;
-        case 6:  run_LayerNorm_kernel_double_warp_reduction_unroll_SMEM(totalRow, totalCol, A, out, mean, rstd, weight, bias); break;
-        case 7:  break;
-        case 8:  break;
-        case 9:  break;
-        case 10: break;
+        case 6:  run_LayerNorm_kernel_warp_reduction_unroll_SMEM(totalRow, totalCol, A, out, mean, rstd, weight, bias); break;
+        case 7:  run_layernorm_forward_kernel_cg_warp(totalRow, totalCol, A, out, mean, rstd, weight, bias); break;
+        case 8:  run_layernorm_forward_kernel_cg_block(totalRow, totalCol, A, out, mean, rstd, weight, bias); break;
+        case 9:  run_layernorm_forward_kernel_cg_warp_advanced(totalRow, totalCol, A, out, mean, rstd, weight, bias); break;
         default:
             // throw：抛出异常，沿调用栈向上传播直到被 catch 捕获
             // std::invalid_argument：标准异常类，表示传入参数不合法
@@ -102,8 +101,8 @@ int main(int argc, char **argv) {
     }
 
     int kernel_num = std::stoi(argv[1]);
-    if (kernel_num < 0 || kernel_num > 10) {
-        std::cerr << "Please enter a valid kernel number (0-12)" << std::endl;
+    if (kernel_num < 0 || kernel_num > 9) {
+        std::cerr << "Please enter a valid kernel number (0-9)" << std::endl;
         exit(EXIT_FAILURE);
     }
 

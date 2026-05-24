@@ -19,10 +19,10 @@ __global__ void LayerNorm_kernel_welford_double_warp_reduction(const scalar_i to
   if (row < totalRow) {
 
     // 静态SMEM分配
-    static_assert(BLOCK_SIZE / 32 == 32, "block的线程需要是1024，刚好覆盖两次warp规约");
-    __shared__ scalar_t reductionMean[BLOCK_SIZE / 32];
-    __shared__ scalar_t reductionVar[BLOCK_SIZE / 32];
-    __shared__ uint reductionCount[BLOCK_SIZE / 32];
+    static_assert(BLOCK_SIZE_X / 32 == 32, "block的线程需要是1024，刚好覆盖两次warp规约");
+    __shared__ scalar_t reductionMean[BLOCK_SIZE_X / 32];
+    __shared__ scalar_t reductionVar[BLOCK_SIZE_X / 32];
+    __shared__ uint reductionCount[BLOCK_SIZE_X / 32];
     scalar_t rowMean {};
     scalar_t rowMeanOld {};
     scalar_t rowVar {};
