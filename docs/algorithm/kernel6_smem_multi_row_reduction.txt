@@ -138,7 +138,28 @@ weight 和 bias 对所有行都相同，因此多行共用同一份拷贝是正�
 
     rowMean = reduction[threadIdx.y][0]; // 每行读取自己的均值
 
-2.4 __syncthreads() 的覆盖范围
+2.4 写回全局内存的线程保护（if threadIDX == 0）
+──────────────────────────────────────────────────
+mean / rstd 的写回只需要一次，但此时 block 内同一行有 BLOCK_SIZE_X_SMEM 条线程，
+所有线程都持有相同的 rowMean / rowVar（warp 全归约后广播给所有 lane）。
+
+  // ✗ 去掉 if：BLOCK_SIZE_X_SMEM=256 条线程全部写 mean[row]
+  __stcs(mean + row, rowMean);   // 256 条重复写入同一地址，浪费带宽
+
+  // ✓ 只让 thread 0 写
+  if (threadIDX == 0) {
+      __stcs(mean + row, rowMean);
+      __stcs(rstd + row, rowVar);
+  }
+
+这不是数据竞争（所有线程写入的值完全相同），而是冗余写入：
+  - 256 条 __stcs 指令只需要完成 1 次全局内存写
+  - 多余的 255 次写入浪费内存带宽，并额外生成 cache line 占用
+  - CUDA 内存模型中多线程并发写同一地址属于未定义行为，即使值相同也应避免
+
+因此加 if (threadIDX == 0) 的目的是效率（避免冗余），而非防止写入错误值。
+
+2.5 __syncthreads() 的覆盖范围
 ────────────────────────────────
 __syncthreads() 是 block 级屏障，对 block 内所有线程（所有 threadIdx.y）生效。
 这意味着：

@@ -10,4 +10,5 @@
 #include "kernels/7_LayerNorm_kernel_cooprative_groups_warp.cuh"
 #include "kernels/8_LayerNorm_kernel_cooprative_groups_block.cuh"
 #include "kernels/9_LayerNorm_kernel_cooperative_warp_advanced.cuh"
+#include "kernels/10_LayerNorm_kernel_warp_reduction_unroll_SMEM.cuh"
 

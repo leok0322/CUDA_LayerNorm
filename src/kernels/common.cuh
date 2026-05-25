@@ -7,6 +7,10 @@
 #endif
 
 
+#ifndef BLOCK_SIZE_Y
+#define BLOCK_SIZE_Y 2
+#endif
+
 #ifndef BLOCK_SIZE_X_kernel3
 #define BLOCK_SIZE_X_kernel3 512
 #endif

@@ -1,0 +1,188 @@
+================================================================================
+  Kernel 10 vs Kernel 6：实现对比与性能分析
+  ── kernel 10 实现解析
+  ── 相对 kernel 6 的改进
+  ── 已知 bug
+  ── 性能数据对比
+  ── 结论
+================================================================================
+
+--------------------------------------------------------------------------------
+一、kernel 10 实现解析
+--------------------------------------------------------------------------------
+
+1.1 设计目标
+────────────
+  kernel 10 是 kernel 6 的简化版本：
+  将 x 维度从 256 缩减到 32（= 一个硬件 warp），使每行恰好由一个 warp 处理，
+  从而消除 kernel 6 中因多 warp 并行带来的二级规约结构和 SMEM 中间缓冲。
+
+1.2 block 维度
+──────────────
+  block：dim3(WARP_SIZE=32, BLOCK_SIZE_Y)
+    threadIdx.x：warp 内 lane，负责列方向（0–31）
+    threadIdx.y：row 编号，负责行方向
+
+  每行恰好由一个 warp（32 线程）处理，步进循环覆盖所有列：
+    for (col = threadIDX; col < totalCol/4; col += WARP_SIZE)
+
+1.3 单级 warp 规约
+──────────────────
+  x=32 = 一个 warp，直接使用 __shfl_xor_sync 蝶形全归约（5 轮），
+  所有 32 条 lane 得到相同的行和（all-reduce），无需借助 SMEM 中转：
+
+    for (int i = 16; i >= 1; i >>= 1)
+        rowMean += __shfl_xor_sync(0xffffffff, rowMean, i, 32);
+
+  不需要 reduction[] SMEM 数组，不需要 __syncthreads()（仅限规约部分）。
+
+1.4 SMEM 布局（与 kernel 6 相同）
+──────────────────────────────────
+  动态 SMEM 三路切分：
+    smemWeight [totalCol/4][5]            — threadIdx.y==0 写，全 block 读
+    smemBias   [totalCol/4][5]            — 同上
+    smemA      [BLOCK_SIZE_Y][totalCol/4 × 5]  — 每行独占，缓存输入 A
+
+  stride-5 布局避免 bank conflict（gcd(5,32)=1）。
+
+  dynSmem = sizeof(float) × (totalCol/4) × 5 × (2 + BLOCK_SIZE_Y)
+
+1.5 写回全局内存
+────────────────
+  mean / rstd 只需 thread 0 写回（避免 BLOCK_SIZE_X_SMEM 条线程冗余写入）：
+
+    if (threadIDX == 0) {
+        __stcs(mean + row, rowMean);
+        __stcs(rstd + row, rowVar);
+    }
+
+--------------------------------------------------------------------------------
+二、相对 kernel 6 的改进
+--------------------------------------------------------------------------------
+
+  ┌───────────────────────────┬──────────────────────────┬──────────────────────────┐
+  │                           │ kernel 6                 │ kernel 10                │
+  ├───────────────────────────┼──────────────────────────┼──────────────────────────┤
+  │ block x 维度              │ BLOCK_SIZE_X_SMEM = 256  │ WARP_SIZE = 32           │
+  │ 每行 warp 数              │ 8                        │ 1                        │
+  │ 规约层数                  │ 二级（warp→SMEM→warp 0） │ 一级（__shfl_xor_sync）  │
+  │ reduction[] 静态 SMEM     │ 需要（BLOCK_SIZE_Y×32）  │ 不需要（零静态 SMEM）    │
+  │ 规约处 __syncthreads()    │ 需要（2 次）             │ 不需要                   │
+  │ 小 totalCol 线程利用率    │ 低（最多 12.5%）         │ 100%                     │
+  └───────────────────────────┴──────────────────────────┴──────────────────────────┘
+
+  核心改进：x=32 消除了二级规约的全部开销
+    - 不再需要 reduction[BLOCK_SIZE_Y_SMEM][32] 静态 SMEM
+    - 去掉规约相关的 2 次 __syncthreads()
+    - 代码结构更简洁，控制流更线性
+
+  小 totalCol 的利用率改善（与 kernel 9 原因相同）：
+    kernel 6 BSX=256，totalCol=128：totalCol/4=32，只有 32 条线程进入循环，
+    224 条线程空转，warp 利用率 12.5%。
+    kernel 10 BSX=32，totalCol=128：32 条线程各处理 4 列，全部满载，利用率 100%。
+
+--------------------------------------------------------------------------------
+三、已知 bug（当前实现存在问题）
+--------------------------------------------------------------------------------
+
+Bug 1（致命）：rowMean 从未除以 totalCol
+─────────────────────────────────────────
+  warp 全归约后 rowMean = Σx（行元素之和），但代码未做除法：
+
+    // ✗ 缺少
+    rowMean /= static_cast<scalar_t>(totalCol);
+
+  导致：
+    - mean[row] 写入的是 Σx，而非 Σx/totalCol
+    - 方差计算 diff = x - rowMean 使用错误的均值
+    - mean、rstd、out 全部输出错误
+
+  对比 kernel 9（正确）：
+    sum = warpReduceSum(sum);
+    float m = sum / totalCol;   // ✓
+
+Bug 2（BLOCK_SIZE_Y > 1 时致命）：smemWeight/smemBias 缺少 __syncthreads()
+────────────────────────────────────────────────────────────────────────────
+  smemWeight/smemBias 由 threadIdx.y==0 写入，但其他行（threadIdx.y=1,2,...）
+  在归一化循环中直接读取，两者之间没有任何 __syncthreads()。
+  BLOCK_SIZE_Y=2 时，threadIdx.y=1 可能读到未初始化的旧值。
+
+  修复：在第一个 for 循环结束后加 __syncthreads()：
+    }  // for col 循环结束
+    __syncthreads();   // ← 保证 smemWeight/smemBias 对所有 threadIdx.y 可见
+
+  注意：__syncthreads() 必须在 if (row < totalRow) 内，但要求 block 内所有线程
+       都能到达（最后一个 block 中越界行需特殊处理，参见 kernel6 的潜在 bug 说明）。
+
+--------------------------------------------------------------------------------
+四、性能数据（m = n 方阵，sm_86，GFLOPS）
+--------------------------------------------------------------------------------
+
+  注意：以下数据为 bug 状态下的测量值（rowMean 未除以 totalCol），
+        结果虽然错误，但 kernel 执行时间本身可作为性能参考。
+
+  ┌──────────────┬──────────┬──────────┬────────────────────────────┐
+  │ (rows, cols) │ kernel 6 │ kernel 10│ 说明                       │
+  ├──────────────┼──────────┼──────────┼────────────────────────────┤
+  │  128 ×  128  │   17.1   │   14.7   │ K10 略低                   │
+  │  256 ×  256  │   36.1   │   54.0   │ K10 +50%                   │
+  │  512 ×  512  │  114.0   │  140.3   │ K10 +23%                   │
+  │ 1024 × 1024  │  238.4   │  190.4   │ K6  +25%                   │
+  │ 2048 × 2048  │  259.1   │  170.9   │ K6  +52%                   │
+  │ 4096 × 4096  │  265.1   │  113.6   │ K6  +133%                  │
+  └──────────────┴──────────┴──────────┴────────────────────────────┘
+
+  规律：
+    totalCol ≤ 512  ：kernel 10 略有优势（小 totalCol 利用率更高）
+    totalCol ≥ 1024 ：kernel 6 显著领先，差距随 totalCol 增大而扩大
+
+  大 totalCol 时 kernel 10 性能下降的原因：
+
+    1. 每线程循环轮次增加，内存延迟隐藏变差（主因）：
+       BSX=32 时每线程循环 totalCol/128 轮（totalCol=4096 → 32 轮），
+       BSX=256 时每线程循环 totalCol/1024 轮（totalCol=4096 → 4 轮）。
+       BSX=256 单轮同时有 256 条线程并发发出内存请求，SM 调度器可以在等待
+       内存返回时切换到其他 warp，延迟隐藏效率更高；
+       BSX=32 每轮只有 32 条线程（一个 warp），串行循环轮次多，
+       内存请求密度低，延迟隐藏机会少。
+
+    2. SMEM 压力（非区分因素，仅作说明）：
+       kernel 6 和 kernel 10 使用相同的 stride-5 公式、相同的 BSY=2，
+       totalCol=4096 时两者 dynSmem 均为 80 KB，SMEM 约束对两者影响相当，
+       不是 kernel 10 相对 kernel 6 性能差距的直接原因。
+       （SMEM 膨胀主要体现在 kernel 10 vs kernel 9 的对比中，见第 3 点）
+
+    3. 对比 kernel 9（BSX=32，有 s_in/smemA，自然对齐，有 .cs hint）：
+       kernel 9 大 totalCol 时性能显著更好，两者均保留了 SMEM 行缓存，
+       差距来自两点：
+         a. stride-5 padding 使 kernel 10 的 dynSmem 比 kernel 9 多 25%
+            （totalCol=4096, BSY=2：K10 = 80 KB，K9 = 64 KB），occupancy 更低；
+         b. kernel 9 对 A 使用 load128cs、对 output 使用 store128cs（.cs hint），
+            减少 L1 污染；kernel 10 使用普通 float4 load/store，cache 竞争更严重。
+
+--------------------------------------------------------------------------------
+五、结论
+--------------------------------------------------------------------------------
+
+  kernel 10 验证了"单 warp per row"设计在中小 totalCol 下的优势：
+    - 消除二级规约，代码更简洁
+    - 小 totalCol（≤512）线程利用率 100%，优于 kernel 6 的 12.5%
+
+
+  与 kernel 9 的性能差距（两者均保留 smemA/s_in）主要来自两点：
+
+  1. stride-5 layout 使 SMEM 膨胀 25%：
+       kernel 9 smemWeight/smemBias/s_in 均使用自然对齐（无 padding），
+       totalCol=4096, BSY=2 时总 dynSmem = 64 KB；
+       kernel 10 使用 stride-5 layout，同配置下总 dynSmem = 80 KB。
+       更高的 SMEM 占用使 SM 能驻留的 block 数更少，occupancy 下降。
+
+  2. 缺少 cache streaming hint：
+       kernel 9 对 A 使用 load128cs（.cs），对 output 使用 store128cs（.cs），
+       防止 A 和 out 长期占用 L1 cache；
+       kernel 10 使用普通 float4 load/store，L1 污染更严重。
+
+  如需提升大 totalCol 性能，应将 smemA/smemWeight/smemBias 改为自然对齐
+  （去掉 stride-5 padding），并对 A 和 output 添加 .cs streaming hint。
+
+================================================================================

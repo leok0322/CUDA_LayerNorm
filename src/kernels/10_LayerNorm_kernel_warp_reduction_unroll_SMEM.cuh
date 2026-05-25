@@ -5,7 +5,7 @@
 
 
 template <typename scalar_t, typename scalar_t4, typename scalar_i>
-__global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_i totalRow, const scalar_i totalCol, scalar_t *A,
+__global__ void LayerNorm_kernel_warp_reduction_unroll_SMEM(const scalar_i totalRow, const scalar_i totalCol, scalar_t *A,
                 scalar_t *out, scalar_t* mean, scalar_t* rstd, scalar_t* weight, scalar_t* bias) {
   // 该线程负责的行
   scalar_i row { blockIdx.y * blockDim.y + threadIdx.y };
@@ -14,23 +14,7 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
   // block的所有线程数
   scalar_i threadNum { blockDim.x };
   // 二级规约的线程数
-  static_assert(BLOCK_SIZE_X_SMEM % 32 == 0, "block的线程需要覆盖完整的warp");
-  scalar_i warp0threadNum {BLOCK_SIZE_X_SMEM / 32};
-
-
-  // 因为一个block处理多行，所以静态SMEM需要放到循环的外面
-
-  // static_assert 和 __shared__ 数组大小均要求编译期常量：
-  //   static_assert(cond)：cond 必须在编译期可求值，否则编译报错
-  //   __shared__ T arr[N]：N 必须是编译期常量，CUDA 不支持动态大小的共享内存数组（VLA）
-  //     原因：编译器在编译期就需要确定每个 block 的 SMEM 布局，分配固定偏移
-  //
-  // threadNum = blockDim.x 是运行时变量：
-  //   blockDim 在 kernel 启动时由 host 传入，编译器无法在编译期知道其值
-  //   因此 __shared__ scalar_t reduction[threadNum / 32] 会编译报错
-  //   必须改用编译期已知的宏 BLOCK_SIZE（在 common.cuh 中定义为 1024）
-  // 因为是二级warp，reduction的长度固定是32，如果
-  __shared__ scalar_t reduction[BLOCK_SIZE_Y_SMEM][32];
+  static_assert(WARP_SIZE == 32, "x维度32个线程，覆盖一个warp");
 
 
   // __align__(16) 只做一件事：令编译器把该变量的基地址放在 16 字节对齐的位置，
@@ -61,8 +45,6 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
   //                          ↑ 偏移 totalCol/4 个 [5] 块，即跳过 smemWeight 的全部元素
   // smemA 紧接 smemBias 之后，flat index: [y][col][k] → y*(totalCol/4)*5 + col*5 + k
   scalar_t *smemA = reinterpret_cast<scalar_t*>(smemBias + totalCol / 4);
-
-
 
   if (row < totalRow) {
     // 求均值
@@ -137,41 +119,20 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
 #pragma Unroll
     // warp树形规约
     for (scalar_i i {16}; i>=1; i>>=1) {
+      // 所有线程得到的rowMean完全相同
+      // 如果total小于32*4,rowMean为0，不影响rowMean的求和
       rowMean += __shfl_xor_sync(0xffffffff,rowMean,i,32);
     }
-    if (threadIDX % 32 == 0) {
-      reduction[threadIdx.y][threadIDX / 32] = rowMean;
-    }
 
-    // SMEM的同步可以放在这里，因为最后计算的时候才会用到
-    __syncthreads();
-
-    // warp0二级规约，
-    if (threadIDX < 32) {
-      rowMean = threadIDX < warp0threadNum ? reduction[threadIdx.y][threadIDX]: static_cast<scalar_t>(0.f);
-    }
-
-
-
-    if (threadIDX < 32) {
-#pragma Unroll
-      for (scalar_i i {16}; i>=1; i>>=1) {
-        rowMean += __shfl_xor_sync(0xffffffff,rowMean,i,32);
-      }
-    }
+    rowMean /= totalCol;
 
     if (threadIDX == 0) {
-      rowMean /= static_cast<scalar_t>(totalCol);
-      reduction[threadIdx.y][threadIDX] = rowMean;
-    }
-
-    __syncthreads();
-
-    rowMean = reduction[threadIdx.y][0];
-    if (threadIDX == 0) {
-      // mean[row] = rowMean;
       __stcs(mean+row,rowMean);
     }
+
+
+    // SMEM加载同步，需要在计算rowVar之前执行
+    __syncthreads();
 
     // 求均方差
     scalar_t rowVar {};
@@ -208,42 +169,16 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
     }
     // warp树形规约
     for (scalar_i i {16}; i>=1; i>>=1) {
+      // 所有线程得到的rowVar完全相同
+      // 如果total小于32*4,rowVar为0，不影响rowVar的求和
       rowVar += __shfl_xor_sync(0xffffffff,rowVar,i,32);
     }
 
-    if (threadIDX % 32 == 0) {
-      reduction[threadIdx.y][threadIDX / 32] = rowVar;
-    }
-
-    __syncthreads();
-
-    // warp0树形规约
-    if (threadIDX < 32) {
-      rowVar = threadIDX < warp0threadNum ? reduction[threadIdx.y][threadIDX] : static_cast<scalar_t>(0.f);
-    }
-
-    // 一个warp不需要同步
-    // __syncthreads();
-
-    if (threadIDX < 32) {
-#pragma Unroll
-      for (scalar_i i {16}; i>=1; i>>=1) {
-        rowVar += __shfl_xor_sync(0xffffffff,rowVar,i,32);
-      }
-    }
-
-    if (threadIDX == 0) {
-      rowVar /= static_cast<scalar_t>(totalCol);
-      // + 1e-5f（ε）：防止方差为 0 时 rsqrtf(0) = Inf，导致输出 NaN
-      // 当输入行所有元素相同时（如全 0、全 1），(xᵢ - μ)² 均为 0，方差精确为 0
-      // ε 是极小正数，对归一化结果的精度影响可忽略，但保证了数值稳定性
-      rowVar = static_cast<scalar_t>(rsqrtf(static_cast<float>(rowVar) + 1e-5f));
-      reduction[threadIdx.y][threadIDX] = rowVar;
-    }
-
-    __syncthreads();
-
-    rowVar = reduction[threadIdx.y][0];
+    rowVar /= static_cast<scalar_t>(totalCol);
+    // + 1e-5f（ε）：防止方差为 0 时 rsqrtf(0) = Inf，导致输出 NaN
+    // 当输入行所有元素相同时（如全 0、全 1），(xᵢ - μ)² 均为 0，方差精确为 0
+    // ε 是极小正数，对归一化结果的精度影响可忽略，但保证了数值稳定性
+    rowVar = static_cast<scalar_t>(rsqrtf(static_cast<float>(rowVar) + 1e-5f));
 
     if (threadIDX == 0) {
       // rstd[row] = rowVar;
