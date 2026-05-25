@@ -73,9 +73,24 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
     for (scalar_i col {threadIDX}; col < totalCol / 4; col+=threadNum) {
       // totalCol是4的倍数，16字节对齐
       // reinterpret_cast cannot cast away const or other type qualifiers，A不能是const指针
-      scalar_t4 vecA = reinterpret_cast<scalar_t4*>(&A[row * totalCol + col * 4])[0];
+      scalar_t4 vecA    = reinterpret_cast<scalar_t4*>(&A[row * totalCol + col * 4])[0];
       scalar_t4 vecWeight = reinterpret_cast<scalar_t4*>(&weight[col * 4])[0];
-      scalar_t4 vecBias = reinterpret_cast<scalar_t4*>(&bias[col * 4])[0];
+      scalar_t4 vecBias   = reinterpret_cast<scalar_t4*>(&bias[col * 4])[0];
+
+      // // A：每行读一次不复用，.cs hint 令数据加载后快速逐出 L1，避免污染 cache
+      // scalar_t4 vecA;
+      // asm volatile("ld.global.cs.v4.f32 {%0,%1,%2,%3}, [%4];"
+      //              : "=f"(vecA.x), "=f"(vecA.y), "=f"(vecA.z), "=f"(vecA.w)
+      //              : "l"(&A[row * totalCol + col * 4]));
+      // // weight/bias：所有 block 共享同一份，.ca hint 缓存到 L1+L2，供后续 block 复用
+      // scalar_t4 vecWeight;
+      // asm volatile("ld.global.ca.v4.f32 {%0,%1,%2,%3}, [%4];"
+      //              : "=f"(vecWeight.x), "=f"(vecWeight.y), "=f"(vecWeight.z), "=f"(vecWeight.w)
+      //              : "l"(&weight[col * 4]));
+      // scalar_t4 vecBias;
+      // asm volatile("ld.global.ca.v4.f32 {%0,%1,%2,%3}, [%4];"
+      //              : "=f"(vecBias.x), "=f"(vecBias.y), "=f"(vecBias.z), "=f"(vecBias.w)
+      //              : "l"(&bias[col * 4]));
 
       rowMean += vecA.x;
       rowMean += vecA.y;
@@ -121,6 +136,8 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
         // smemBias[col * 4 + 2] = vecBias.z;
         // smemBias[col * 4 + 3] = vecBias.w;
 
+
+        // 无bank conflict
         smemWeight[col][0] = vecWeight.x;
         smemWeight[col][1] = vecWeight.y;
         smemWeight[col][2] = vecWeight.z;
@@ -267,6 +284,10 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
       vecA.z = smemWeight[col][2] * ((vecA.z - rowMean) * rowVar) + smemBias[col][2];
       vecA.w = smemWeight[col][3] * ((vecA.w - rowMean) * rowVar) + smemBias[col][3];
       reinterpret_cast<scalar_t4*>(&out[row * totalCol + col * 4])[0] = vecA;
+      // output：写一次即完成，.cs hint 写入后快速逐出 L1，减少 cache 污染
+      // asm volatile("st.global.cs.v4.f32 [%0], {%1,%2,%3,%4};"
+      //              : : "l"(&out[row * totalCol + col * 4]),
+      //                  "f"(vecA.x), "f"(vecA.y), "f"(vecA.z), "f"(vecA.w));
     }
   }
 }
