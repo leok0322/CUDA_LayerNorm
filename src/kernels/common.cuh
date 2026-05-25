@@ -18,7 +18,7 @@
 
 
 #ifndef BLOCK_SIZE_Y_SMEM
-#define BLOCK_SIZE_Y_SMEM 4
+#define BLOCK_SIZE_Y_SMEM 2
 #endif
 
 #ifndef MAX_TOTALCOL
@@ -52,6 +52,26 @@ __device__ inline x128 load128(const float* addr) {
 // Streaming 128-bit 加载（.cs hint：绕过 L1 只进 L2，保留 cache 给其他高复用数据）
 __device__ inline x128 load128cs(const float* addr) {
     x128 x;
+    // asm volatile(PTX指令字符串  : 输出操作数  : 输入操作数);
+    //
+    // PTX 指令：ld.global.cs.v4.f32 {dst0,dst1,dst2,dst3}, [src]
+    //   ld          ：load 指令
+    //   global      ：地址空间为全局内存（cudaMalloc / __device__ 变量）
+    //   cs          ：cache streaming hint，数据加载后在 L1 快速逐出（不长期占用 L1）
+    //   v4.f32      ：向量宽度 4，元素类型 float（单次指令传输 4×4=16 字节 / 128-bit）
+    //   {%0,%1,%2,%3}：4 个目标寄存器，对应输出操作数列表中的 %0~%3
+    //   [%4]        ：源地址寄存器，取自输入操作数列表中的 %4
+    //
+    // 输出操作数（冒号后第一段）：
+    //   "=f"(x.data[0])  → %0，"=f" 表示写入（=）、float 寄存器（f），绑定到 x.data[0]
+    //   "=f"(x.data[1])  → %1，同上，绑定到 x.data[1]
+    //   "=f"(x.data[2])  → %2
+    //   "=f"(x.data[3])  → %3
+    //
+    // 输入操作数（冒号后第二段）：
+    //   "l"(addr)        → %4，"l" 表示 64-bit 整数寄存器（指针），绑定到 addr
+    //
+    // volatile：禁止编译器将此 asm 块重排或消除（即使输出值未被使用）
     asm volatile("ld.global.cs.v4.f32 {%0,%1,%2,%3}, [%4];"
                  : "=f"(x.data[0]), "=f"(x.data[1]), "=f"(x.data[2]), "=f"(x.data[3])
                  : "l"(addr));
@@ -60,6 +80,21 @@ __device__ inline x128 load128cs(const float* addr) {
 
 // Streaming 128-bit 存储（.cs hint：写入后数据尽快逐出 L1，减少 cache 污染）
 __device__ inline void store128cs(float* addr, x128 val) {
+    // PTX 指令：st.global.cs.v4.f32 [dst], {src0,src1,src2,src3}
+    //   st          ：store 指令
+    //   global      ：目标地址空间为全局内存
+    //   cs          ：cache streaming hint，写入后 L1 快速逐出（write-once 数据不应长占 L1）
+    //   v4.f32      ：一次写 4×float = 128-bit
+    //   [%0]        ：目标地址，取自输入操作数 %0
+    //   {%1,%2,%3,%4}：4 个源寄存器，对应输入操作数 %1~%4
+    //
+    // 操作数列表（输出段为空，故两个冒号紧邻）：
+    //   ": :"        ：输出操作数为空（store 无 C++ 侧输出变量）
+    //   "l"(addr)          → %0，64-bit 指针寄存器
+    //   "f"(val.data[0])   → %1，float 寄存器（只读，无 = 前缀）
+    //   "f"(val.data[1])   → %2
+    //   "f"(val.data[2])   → %3
+    //   "f"(val.data[3])   → %4
     asm volatile("st.global.cs.v4.f32 [%0], {%1,%2,%3,%4};"
                  : : "l"(addr), "f"(val.data[0]), "f"(val.data[1]), "f"(val.data[2]), "f"(val.data[3]));
 }

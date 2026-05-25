@@ -107,7 +107,7 @@ void run_LayerNorm_kernel_warp_reduction_unroll_SMEM(const uint totalRow, const 
   cudaCheck(cudaFuncSetAttribute(
     (const void*)LayerNorm_kernel_warp_reduction_unroll_SMEM<float, float4, uint>,
     cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(maxDynamic)));
-  LayerNorm_kernel_warp_reduction_unroll_SMEM<float, float4,uint><<<grid, block, dynSmem,0>>>(totalRow,totalCol,A,out,mean,rstd,weight,bias);
+  LayerNorm_kernel_warp_reduction_unroll_SMEM<float, float4, uint><<<grid, block, dynSmem,0>>>(totalRow,totalCol,A,out,mean,rstd,weight,bias);
   cudaCheck(cudaGetLastError());
 }
 
