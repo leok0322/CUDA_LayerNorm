@@ -267,7 +267,7 @@ int main(int argc, char **argv) {
 
             // ── 结果写入文件 ──────────────────────────────────────────────────────
             std::filesystem::create_directories(resultDir);
-            const std::string resultLogFile = resultDir + "/softmax_kernel_" + argv[1] + "_result.txt";
+            const std::string resultLogFile = resultDir + "/LayerNorm_kernel_" + argv[1] + "_result.txt";
             // fs 在 for 循环体内声明：每次迭代创建新对象，迭代结束析构 → 自动 close()
             //   因此每次迭代都要重新 open()，open() 的模式决定文件内容是否保留
             std::ofstream fs;
