@@ -1,0 +1,100 @@
+================================================================================
+  CUDA 动态共享内存（extern __shared__）说明
+  ── 声明语法与地址规则
+  ── 多个声明的陷阱
+  ── 正确做法：单一声明 + 手动切分
+  ── 两路 / 三路切分示例
+================================================================================
+
+--------------------------------------------------------------------------------
+一、语法与地址规则
+--------------------------------------------------------------------------------
+
+  kernel 启动时通过 <<<grid, block, dynSmem>>> 分配一块连续动态 SMEM。
+  kernel 内用 extern __shared__ 声明裸指针，指向该块的起始地址：
+
+    extern __shared__ float smem[];   // smem == &动态SMEM[0]
+
+  关键规则：
+    所有 extern __shared__ 声明均指向 同一个 起始地址，与变量名无关。
+    CUDA 编译器对 extern __shared__ 变量不做独立布局，只提供起始地址的视图。
+
+--------------------------------------------------------------------------------
+二、多个声明的陷阱（致命错误）
+--------------------------------------------------------------------------------
+
+  // ✗ 错误：两个变量指向同一起始地址，写 smemA 会覆盖 smem 的内容
+  extern __shared__ __align__(16) scalar_t smem[];    // 起始地址 base
+  extern __shared__ __align__(16) scalar_t smemA[];   // 同样是 base！
+
+  外观上像两块独立内存，实际上完全重叠：
+    smem   == smemA == &动态SMEM[0]
+
+  后果：
+    smemWeight / smemBias 通过 smem 写入的数据，
+    会被通过 smemA 写入的数据原地覆盖，导致静默数据错误。
+
+  编译器不会警告，运行时不会报错，结果直接出错。
+
+--------------------------------------------------------------------------------
+三、正确做法：单一 extern __shared__ + 手动切分
+--------------------------------------------------------------------------------
+
+  只声明一个 extern __shared__，用指针算术在其上建立多个分区：
+
+    extern __shared__ __align__(16) scalar_t smem[];   // 唯一入口
+
+    // 第一路：smemWeight，形状 [totalCol/4][5]
+    scalar_t (*smemWeight)[5] = reinterpret_cast<scalar_t(*)[5]>(smem);
+
+    // 第二路：smemBias，紧接 smemWeight 之后
+    scalar_t (*smemBias)[5]   = smemWeight + totalCol / 4;
+    //   偏移 = (totalCol/4) 个 scalar_t[5] 块 = (totalCol/4)*5*sizeof(scalar_t) 字节
+
+    // 第三路：smemA，紧接 smemBias 之后，裸指针 + flat index
+    scalar_t *smemA = reinterpret_cast<scalar_t*>(smemBias + totalCol / 4);
+    //   flat index: [y][col][k] → y*(totalCol/4)*5 + col*5 + k
+
+  内存布局（连续，无重叠）：
+    ┌─────────────────────┬─────────────────────┬────────────────────────────────┐
+    │ smemWeight          │ smemBias             │ smemA                          │
+    │ [totalCol/4][5]     │ [totalCol/4][5]      │ [BSY][totalCol/4][5]           │
+    └─────────────────────┴─────────────────────┴────────────────────────────────┘
+    ↑ smem（base）         ↑ smemWeight+C/4       ↑ smemBias+C/4
+    BSY = BLOCK_SIZE_Y_SMEM，C = totalCol
+
+--------------------------------------------------------------------------------
+四、dynSmem 字节数计算
+--------------------------------------------------------------------------------
+
+  两路切分（smemWeight + smemBias）：
+    size_t dynSmem = sizeof(scalar_t) * 2 * (totalCol / 4) * 5;
+
+  三路切分（+ smemA）：
+    size_t dynSmem = sizeof(scalar_t) * (totalCol / 4) * 5 * (2 + BLOCK_SIZE_Y_SMEM);
+
+  此值作为 <<<>>> 第三参数传入：
+    kernel<<<grid, block, dynSmem>>>(args...);
+
+--------------------------------------------------------------------------------
+五、常见错误汇总
+--------------------------------------------------------------------------------
+
+  ① 多个 extern __shared__ 声明（本文重点）：
+       extern __shared__ float smemWeight[];   // base
+       extern __shared__ float smemBias[];     // 同样是 base，互相覆盖
+       // ✓ 只保留一个，其余通过指针算术偏移
+
+  ② 偏移单位错误（字节 vs 元素）：
+       // ✗ 以字节为单位，但指针算术以元素为单位
+       scalar_t (*smemBias)[5] = (scalar_t(*)[5])((char*)smemWeight + totalCol / 4);
+       // ✓ 元素偏移（步长自动 × sizeof(scalar_t[5])）
+       scalar_t (*smemBias)[5] = smemWeight + totalCol / 4;
+
+  ③ 第三路忘记 reinterpret_cast，直接用数组指针偏移赋给裸指针：
+       // ✗ 类型不匹配，编译报错
+       scalar_t *smemA = smemBias + totalCol / 4;
+       // ✓ reinterpret_cast 转换类型后再赋值
+       scalar_t *smemA = reinterpret_cast<scalar_t*>(smemBias + totalCol / 4);
+
+================================================================================

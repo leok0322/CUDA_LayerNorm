@@ -1,0 +1,193 @@
+================================================================================
+  C++ 数组指针详解
+  ── 语法与类型解析
+  ── 与指针数组的区别
+  ── 指针算术与步长
+  ── 应用：动态 SMEM 切分
+================================================================================
+
+--------------------------------------------------------------------------------
+一、语法与类型解析
+--------------------------------------------------------------------------------
+
+  T (*p)[N]   ：指向"长度为 N 的 T 数组"的指针（数组指针）
+  T *p[N]     ：长度为 N 的"T 指针"数组（指针数组）
+
+  括号决定优先级：
+    T (*p)[N]   → * 先与 p 结合 → p 是指针 → 指向 T[N]
+    T *p[N]     → [] 先与 p 结合 → p 是数组 → 元素是 T*
+
+  内存中 p 本身始终是一个指针（8 字节），区别在于它指向的类型：
+    T (*p)[N]  → sizeof(*p) = N × sizeof(T)，+1 跳过整个数组
+    T *p[N]    → p 是数组，不是指针，sizeof(p) = N × 8
+
+--------------------------------------------------------------------------------
+二、步长（指针算术）
+--------------------------------------------------------------------------------
+
+  数组指针的步长 = 它所指向的数组的完整大小：
+
+    int (*p)[5];
+    p + 1  →  地址增加 5 × sizeof(int) = 20 字节
+    p + k  →  地址增加 k × 20 字节
+
+  普通指针步长 = 元素大小：
+    int *q;
+    q + 1  →  地址增加 sizeof(int) = 4 字节
+
+  示例：
+    int arr[3][5] = { {0..4}, {5..9}, {10..14} };
+    int (*p)[5] = arr;   // p 指向第 0 行
+    p + 1                // 指向第 1 行（跳过 20 字节）
+    *(p + 1)             // 第 1 行数组，类型 int[5]
+    (*(p + 1))[2]        // arr[1][2] = 7
+    p[1][2]              // 同上，语法糖
+
+--------------------------------------------------------------------------------
+三、reinterpret_cast 赋予裸指针数组形状
+--------------------------------------------------------------------------------
+
+  裸指针（T*）没有行列信息，reinterpret_cast 将其重解释为数组指针，
+  赋予步长语义，使 [][N] 二维访问成为合法操作。
+
+  语法：
+    T* raw = ...;                             // 裸指针，步长 sizeof(T)
+    T (*p)[N] = reinterpret_cast<T(*)[N]>(raw);  // 步长变为 N×sizeof(T)
+
+  之后可以用 p[row][col] 访问，等价于 raw[row * N + col]：
+    p[row][col]  ≡  *(*(p + row) + col)
+                 ≡  raw[row * N + col]
+
+--------------------------------------------------------------------------------
+四、应用：动态 SMEM 切分（CUDA kernel 6）
+--------------------------------------------------------------------------------
+
+  背景：
+    kernel 启动时通过 <<<grid, block, dynSmem>>> 分配一块连续的动态共享内存，
+    kernel 内用 extern __shared__ 声明裸指针，需要在其上建立二维数组语义。
+
+  目标：
+    将一块连续 SMEM 切分为两个形状均为 [totalCol/4][5] 的二维数组：
+      smemWeight[totalCol/4][5]   // 前半段
+      smemBias  [totalCol/4][5]   // 后半段
+
+  代码：
+    extern __shared__ __align__(16) float smem[];
+
+    // reinterpret_cast：将 float* 重解释为 float(*)[5]，步长变为 5×4=20 字节
+    float (*smemWeight)[5] = reinterpret_cast<float(*)[5]>(smem);
+
+    // 指针算术：跳过 (totalCol/4) 个 float[5] 块，正好到 smemBias 起始位置
+    // 偏移字节数 = (totalCol/4) × 5 × sizeof(float)
+    float (*smemBias)[5]   = smemWeight + totalCol / 4;
+
+  访问示例（col ∈ [0, totalCol/4)，k ∈ [0, 5)）：
+    smemWeight[col][k]  →  地址 = smem + col×5 + k（以 float 为单位）
+    smemBias  [col][k]  →  地址 = smem + (totalCol/4)×5 + col×5 + k
+
+  内存布局：
+    ┌──────────────────────────┬──────────────────────────┐
+    │  smemWeight[0..C/4-1][5] │  smemBias[0..C/4-1][5]   │
+    └──────────────────────────┴──────────────────────────┘
+    ↑ smem（起始）              ↑ smemWeight + totalCol/4
+
+  所需 dynSmem 字节数（传给 <<<>>> 第3参数）：
+    size_t dynSmem = sizeof(float) * 2 * (totalCol / 4) * 5;
+
+  ── 扩展：三路切分（增加 smemA 缓存输入行）──────────────────────────────────
+  在 smemWeight / smemBias 之后，紧接着放 smemA（形状 [BLOCK_SIZE_Y_SMEM][totalCol/4][5]）。
+  smemA 的维度含运行时量 totalCol，不能用数组指针，改用裸指针 + flat index。
+
+  代码：
+    extern __shared__ __align__(16) float smem[];
+
+    float (*smemWeight)[5] = reinterpret_cast<float(*)[5]>(smem);
+    float (*smemBias)[5]   = smemWeight + totalCol / 4;
+    // smemBias + totalCol/4 跳过 smemBias 的全部元素，指向 smemA 起始
+    float *smemA           = reinterpret_cast<float*>(smemBias + totalCol / 4);
+
+  访问 smemA[y][col][k]（flat index）：
+    smemA[y * (totalCol / 4) * 5 + col * 5 + k]
+
+  内存布局：
+    ┌─────────────────────┬─────────────────────┬────────────────────────────────┐
+    │ smemWeight[0..C/4-1]│ smemBias [0..C/4-1] │ smemA[0..BSY-1][0..C/4-1][5]  │
+    │        [5]          │        [5]           │                                │
+    └─────────────────────┴─────────────────────┴────────────────────────────────┘
+    C = totalCol，BSY = BLOCK_SIZE_Y_SMEM
+
+  所需 dynSmem 字节数：
+    size_t dynSmem = sizeof(float) * (totalCol / 4) * 5 * (2 + BLOCK_SIZE_Y_SMEM);
+
+--------------------------------------------------------------------------------
+五、常见错误
+--------------------------------------------------------------------------------
+
+  ① 括号漏掉，变成指针数组（含义完全不同）：
+       float *smemWeight[5]   // ✗ 5 个 float* 的数组，不是数组指针
+
+  ② 两个 extern __shared__ 指向同一地址：
+       extern __shared__ float smemWeight[];  // 指向 SMEM 起始
+       extern __shared__ float smemBias[];    // 同样指向 SMEM 起始！互相覆盖
+       // ✓ 正确：只声明一个，手动偏移切分
+
+  ③ 偏移单位搞错（以字节偏移而非元素偏移）：
+       float (*smemBias)[5] = (float(*)[5])((char*)smemWeight + totalCol/4); // ✗ 字节数不对
+       float (*smemBias)[5] = smemWeight + totalCol / 4;                     // ✓ 元素偏移
+
+--------------------------------------------------------------------------------
+六、三维数组指针与运行时维度限制
+--------------------------------------------------------------------------------
+
+  二维扩展到三维，语法一致：
+    T (*p)[M][N]  ：指向 T[M][N] 的指针，步长 = M × N × sizeof(T)
+    p[i][j][k]    ：等价于 raw[i*M*N + j*N + k]
+
+  三维 SMEM 示例（目标形状 [BLOCK_SIZE_Y_SMEM][totalCol/4][5]）：
+
+  ── 问题：运行时维度不能作为数组指针的维度 ──────────────────────────────────
+  C++ 数组指针的所有维度必须是编译期常量（constexpr）。
+  totalCol 是 kernel 的运行时参数，不满足此要求：
+
+    // ✗ 编译报错：totalCol 不是编译期常量
+    scalar_t (*p)[totalCol / 4][5] = reinterpret_cast<scalar_t (*)[totalCol / 4][5]>(smemA);
+
+  ── 方案一：用编译期常量 MAX_TOTALCOL 替代 totalCol ──────────────────────────
+    extern __shared__ __align__(16) scalar_t smemA[];
+    scalar_t (*p)[MAX_TOTALCOL / 4][5] =
+        reinterpret_cast<scalar_t (*)[MAX_TOTALCOL / 4][5]>(smemA);
+
+    p[y][col][k]   // 访问第 y 行、第 col 组、第 k 个元素
+
+  缺点：步长按 MAX_TOTALCOL 计算，实际 totalCol < MAX_TOTALCOL 时行间有空洞，
+        SMEM 布局不连续，dynSmem 必须按 MAX_TOTALCOL 分配，浪费空间。
+
+  ── 方案二：手动 flat index（推荐，无空洞）────────────────────────────────────
+    extern __shared__ __align__(16) scalar_t smemA[];
+
+    // [y][col][k] → flat index = y*(totalCol/4)*5 + col*5 + k
+    scalar_t val = smemA[y * (totalCol / 4) * 5 + col * 5 + k];
+
+  优点：完全运行时，SMEM 紧凑排布，dynSmem 随 totalCol 精确分配。
+  缺点：访问语法不如 p[y][col][k] 直观，需手动维护步长计算。
+
+  ── 常见误用：把维度值直接当下标 ────────────────────────────────────────────
+  smemA 是裸指针 scalar_t*，不能使用多维下标：
+
+    // ✗ 错误：scalar_t* 不支持链式 [][]，无法编译
+    scalar_t x = smemA[threadIdx.y][totalCol / 4 * 5][col * 5];
+
+  原因一：scalar_t* 的 smemA[i] 返回 scalar_t 值，不是指针，无法继续 [j][k]。
+  原因二：即使改写为数组指针 scalar_t (*p)[D2][D3]，正确的访问是 p[y][col][k]，
+          维度 D2 = totalCol/4 是运行时值，不满足数组指针的编译期常量要求。
+
+  flat index 左结合注意事项：
+
+    smemA[threadIdx.y * totalCol / 4 * 5 + col * 5]
+    // 等价于 ((threadIdx.y * totalCol) / 4) * 5 + col * 5
+    // totalCol 是 4 的倍数时结果正确，但含义不直观
+
+    // ✓ 建议加括号明确优先级：
+    smemA[threadIdx.y * (totalCol / 4) * 5 + col * 5]
+
+================================================================================

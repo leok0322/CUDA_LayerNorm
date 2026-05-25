@@ -87,15 +87,27 @@ void run_LayerNorm_kernel_warp_reduction_unroll_SMEM(const uint totalRow, const 
   dim3 block(BLOCK_SIZE_X_SMEM, BLOCK_SIZE_Y_SMEM, 1);
   assert(totalCol % 4 == 0 && "向量化加载不能完整覆盖所有列");
   // per-block SMEM 上限 = 静态 + MaxDynamic。
-  // 该 kernel 动态 SMEM = 0，故 MaxDynamic = 0，上限 = 静态 SMEM = 40.5 KB。
-  // 默认上限 48 KB > 40.5 KB，当前无需调用；
-  // 防御性保留：若 MAX_TOTALCOL 增大导致静态超过 48 KB，此调用解除默认限制。
-  constexpr size_t static_smem = sizeof(float) * (BLOCK_SIZE_Y_SMEM * 32 + 2 * (MAX_TOTALCOL / 4) * 5);
-  constexpr size_t max_dynamic = static_smem < 48 * 1024 ? 48 * 1024 - static_smem: 0;
+  // smemWeight + smemBias 改为动态 SMEM，静态 SMEM 仅剩 reduction（0.5 KB），远低于 48 KB
+
+
+  // cudaFuncSetAttribute 是针对 kernel 函数的全局设置，driver 用它选 SMEM 分区档位。每次传入不同的 dynSmem（随 totalCol 变化）会导致 driver 反复调整档位，有额外开销。
+  // 应该只调用一次，传最坏情况（MAX_TOTALCOL），一次选好档位：
+  //  1、但是这样就和静态SMEM没有区别，并且maxDynamic 基于 MAX_TOTALCOL 计算，实际每次传入的 dynSmem 基于当前 totalCol，MAX_TOTALCOL的设置可能需要调整
+  //  2、driver 根据 static + maxDynamic（声明上限）选 SMEM 分区档位，而不是根据实际 dynSmem。所以即使 totalCol=128 时 dynSmem 只有 1.25 KB，分区档位仍按 MAX_TOTALCOL 对应的最坏情况选，L1 被压缩到最坏情况大小，不会因实际用量小而扩大。
+  // constexpr size_t maxDynamic = sizeof(float) * 2 * (MAX_TOTALCOL / 4) * 5;
+
+  // 设置静态加动态smem最小为64KB
+  //  1、每次修改动态smem有额外开销
+  //  2、更灵活，l1根据设置的SMEM大小动态调整。
+  constexpr size_t static_smem = sizeof(float) * BLOCK_SIZE_Y_SMEM * 32;
+  // SMEM动态存储A的每一列元素和weight、bias以供复用，因为totalCol不是编译器常量，所以需要用动态smem
+  size_t dynSmem { sizeof(float)  * (totalCol / 4) * 5 *  (2 + BLOCK_SIZE_Y_SMEM) };
+  size_t maxDynamicDiff = static_smem + dynSmem < 48 * 1024 ? 48 * 1024 - (static_smem + dynSmem): 0;
+  size_t maxDynamic {dynSmem + maxDynamicDiff};
   cudaCheck(cudaFuncSetAttribute(
     (const void*)LayerNorm_kernel_warp_reduction_unroll_SMEM<float, float4, uint>,
-    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)max_dynamic));
-  LayerNorm_kernel_warp_reduction_unroll_SMEM<float, float4,uint><<<grid, block, 0, 0>>>(totalRow,totalCol,A,out,mean,rstd,weight,bias);
+    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(maxDynamic)));
+  LayerNorm_kernel_warp_reduction_unroll_SMEM<float, float4,uint><<<grid, block, dynSmem,0>>>(totalRow,totalCol,A,out,mean,rstd,weight,bias);
   cudaCheck(cudaGetLastError());
 }
 

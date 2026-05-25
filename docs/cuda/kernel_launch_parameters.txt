@@ -1,0 +1,129 @@
+================================================================================
+  CUDA Kernel 启动参数说明
+  ── <<<gridDim, blockDim, sharedMem, stream>>> 四个参数
+  ── 类型要求与默认值
+  ── 常见错误与示例
+================================================================================
+
+--------------------------------------------------------------------------------
+一、语法与参数顺序
+--------------------------------------------------------------------------------
+
+  kernel<<<gridDim, blockDim, sharedMem, stream>>>(args...);
+
+  ┌──────────┬──────────────┬───────────────┬──────────────────────────────────┐
+  │ 位置     │ 参数名       │ 类型          │ 含义                             │
+  ├──────────┼──────────────┼───────────────┼──────────────────────────────────┤
+  │ 1        │ gridDim      │ dim3 / int    │ grid 中 block 的三维数量         │
+  │ 2        │ blockDim     │ dim3 / int    │ block 中线程的三维数量           │
+  │ 3        │ sharedMem    │ size_t        │ 动态 SMEM 字节数，缺省为 0       │
+  │ 4        │ stream       │ cudaStream_t  │ 执行流，缺省为 0（默认流）       │
+  └──────────┴──────────────┴───────────────┴──────────────────────────────────┘
+
+  参数 3、4 可省略，省略时取缺省值：
+    kernel<<<grid, block>>>(...)          // sharedMem=0, stream=0
+    kernel<<<grid, block, smem>>>(...)    // stream=0
+    kernel<<<grid, block, smem, s>>>(...)  // 全部显式指定
+
+--------------------------------------------------------------------------------
+二、各参数详解
+--------------------------------------------------------------------------------
+
+2.1 gridDim（dim3 / int）
+───────────────────────────
+  dim3 是三分量无符号整数结构体：
+    struct dim3 { unsigned x, y, z; };
+    dim3()         → (1, 1, 1)（缺省构造）
+    dim3(x)        → (x, 1, 1)
+    dim3(x, y)     → (x, y, 1)
+    dim3(x, y, z)  → (x, y, z)
+
+  传入 int/uint 时自动转换为 dim3(n, 1, 1)：
+    kernel<<<1024, 256>>>   等价于   kernel<<<dim3(1024), dim3(256)>>>
+
+  grid 总 block 数 = gridDim.x × gridDim.y × gridDim.z
+  每个 block 内用 blockIdx.x / .y / .z 索引
+
+2.2 blockDim（dim3 / int）
+───────────────────────────
+  block 总线程数 = blockDim.x × blockDim.y × blockDim.z ≤ 1024（硬件上限）
+  每条线程用 threadIdx.x / .y / .z 索引
+
+2.3 sharedMem（size_t）
+────────────────────────
+  动态 SMEM 的字节数，对应 kernel 内 extern __shared__ 声明的内存大小。
+  静态 SMEM（__shared__ 直接声明固定大小数组）不在此参数中指定，由编译器自动分配。
+
+  per-block 实际占用 = 静态 SMEM + sharedMem（第3参数）
+  必须满足：per-block 实际占用 ≤ per-block 软件上限（默认 48 KB，可通过
+            cudaFuncSetAttribute 提升至最大 99 KB，详见 cudaFuncSetAttribute.txt）
+
+  类型为 size_t（无符号），传入负数会被解释为极大正数，导致启动失败。
+
+2.4 stream（cudaStream_t）
+───────────────────────────
+  CUDA 流句柄，控制 kernel 的执行顺序与并发：
+    0 或 nullptr ：默认流，与其他默认流操作串行执行
+    cudaStream_t s：自定义流，不同流之间可并发执行（需设备支持）
+
+  创建与销毁：
+    cudaStream_t s;
+    cudaStreamCreate(&s);
+    kernel<<<grid, block, 0, s>>>(...);
+    cudaStreamDestroy(s);
+
+--------------------------------------------------------------------------------
+三、常见错误
+--------------------------------------------------------------------------------
+
+3.1 参数顺序写反（sharedMem 与 stream 混淆）
+──────────────────────────────────────────────
+  // ✗ 错误：0 当作 sharedMem，dynSmem 被强转为 cudaStream_t
+  kernel<<<grid, block, 0, dynSmem>>>(...);
+
+  // ✓ 正确：dynSmem 作为 sharedMem，stream 默认 0
+  kernel<<<grid, block, dynSmem>>>(...);
+
+3.2 sharedMem 传负数
+──────────────────────
+  // ✗ 错误：-1 被隐式转换为 size_t 极大值，kernel 启动失败
+  int smem = -1;
+  kernel<<<grid, block, smem>>>(...);
+
+3.3 动态 SMEM 超过上限未设 cudaFuncSetAttribute
+────────────────────────────────────────────────
+  // ✗ 错误：sharedMem > 48 KB 但未提升上限，返回 cudaErrorInvalidValue
+  kernel<<<grid, block, 60 * 1024>>>(...);
+
+  // ✓ 正确：先提升上限，再启动
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 60 * 1024);
+  kernel<<<grid, block, 60 * 1024>>>(...);
+
+--------------------------------------------------------------------------------
+四、示例
+--------------------------------------------------------------------------------
+
+4.1 一维 grid + 动态 SMEM + 自定义 stream
+───────────────────────────────────────────
+  cudaStream_t stream;
+  cudaStreamCreate(&stream);
+
+  size_t dyn_smem = sizeof(float) * 2 * (totalCol / 4) * 5;
+  dim3 grid(cuda::ceil_div(totalRow, BLOCK_SIZE_Y_SMEM));
+  dim3 block(BLOCK_SIZE_X_SMEM, BLOCK_SIZE_Y_SMEM);
+
+  kernel<<<grid, block, dyn_smem, stream>>>(args...);
+  cudaStreamDestroy(stream);
+
+4.2 无动态 SMEM，默认 stream（最常见写法）
+───────────────────────────────────────────
+  dim3 grid(1, totalRow, 1);
+  dim3 block(BLOCK_SIZE_X, 1, 1);
+  kernel<<<grid, block>>>(args...);        // 等价于 <<<grid, block, 0, 0>>>
+
+4.3 整数简写（一维 grid 和 block）
+────────────────────────────────────
+  kernel<<<1024, 256>>>(args...);
+  // 等价于 kernel<<<dim3(1024,1,1), dim3(256,1,1), 0, 0>>>
+
+================================================================================

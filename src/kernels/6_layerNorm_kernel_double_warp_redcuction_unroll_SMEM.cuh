@@ -32,7 +32,7 @@ __global__ void LayerNorm_kernel_warp_reduction_unroll_SMEM(const scalar_i total
   // 因为是二级warp，reduction的长度固定是32，如果
   __shared__ scalar_t reduction[BLOCK_SIZE_Y_SMEM][32];
 
-  static_assert(MAX_TOTALCOL % 4 == 0, "MAX_TOTALCOL是4的倍数");
+
   // __align__(16) 只做一件事：令编译器把该变量的基地址放在 16 字节对齐的位置，
   // 不影响数组内部布局，也不影响每次访问的偏移计算。
   //
@@ -49,8 +49,18 @@ __global__ void LayerNorm_kernel_warp_reduction_unroll_SMEM(const scalar_i total
   //   基地址也恰好 16 字节对齐，实际效果相同。
   //   保留它是防御性写法：防止将来在 smemWeight 前插入奇数大小的 SMEM 变量
   //   导致基地址偏移，破坏潜在的向量化对齐假设。
-  __shared__ __align__(16) scalar_t smemWeight[MAX_TOTALCOL / 4][5];
-  __shared__ __align__(16) scalar_t smemBias[MAX_TOTALCOL / 4][5];
+  // __shared__ __align__(16) scalar_t smemWeight[MAX_TOTALCOL / 4][5];
+  // __shared__ __align__(16) scalar_t smemBias[MAX_TOTALCOL / 4][5];
+
+  // 动态SMEM：单一声明，手动三路切分
+  // 布局：[smemWeight: (totalCol/4)×5] [smemBias: (totalCol/4)×5] [smemA: BLOCK_SIZE_Y_SMEM×(totalCol/4)×5]
+  // dynSmem = sizeof(scalar_t) * (totalCol/4) * 5 * (2 + BLOCK_SIZE_Y_SMEM)
+  extern __shared__ __align__(16) scalar_t smem[];
+  scalar_t (*smemWeight)[5] = reinterpret_cast<scalar_t(*)[5]>(smem);
+  scalar_t (*smemBias)[5]   = smemWeight + totalCol / 4;
+  //                          ↑ 偏移 totalCol/4 个 [5] 块，即跳过 smemWeight 的全部元素
+  // smemA 紧接 smemBias 之后，flat index: [y][col][k] → y*(totalCol/4)*5 + col*5 + k
+  scalar_t *smemA = reinterpret_cast<scalar_t*>(smemBias + totalCol / 4);
 
   if (row < totalRow) {
     // 求均值
@@ -67,8 +77,15 @@ __global__ void LayerNorm_kernel_warp_reduction_unroll_SMEM(const scalar_i total
       rowMean += vecA.z;
       rowMean += vecA.w;
 
+      smemA[threadIdx.y * totalCol / 4 * 5 + col * 5] = vecA.x;
+      smemA[threadIdx.y * totalCol / 4 * 5 + col * 5 + 1] = vecA.y;
+      smemA[threadIdx.y * totalCol / 4 * 5 + col * 5 + 2] = vecA.z;
+      smemA[threadIdx.y * totalCol / 4 * 5 + col * 5 + 3] = vecA.w;
+
+
       scalar_t4 vecWeight = reinterpret_cast<scalar_t4*>(&weight[col * 4])[0];
       scalar_t4 vecBias = reinterpret_cast<scalar_t4*>(&bias[col * 4])[0];
+
 
       if (threadIdx.y == 0) {
         // ── bank conflict 分析 ────────────────────────────────────────────────
@@ -149,7 +166,8 @@ __global__ void LayerNorm_kernel_warp_reduction_unroll_SMEM(const scalar_i total
     __syncthreads();
 
     rowMean = reduction[threadIdx.y][0];
-    mean[row] = rowMean;
+    // mean[row] = rowMean;
+    __stcs(mean+row,rowMean);
 
     // 求均方差
     scalar_t rowVar {};
@@ -158,16 +176,30 @@ __global__ void LayerNorm_kernel_warp_reduction_unroll_SMEM(const scalar_i total
 #pragma Unroll URF
     // 向量化加载
     for (scalar_i col {threadIDX}; col< totalCol / 4; col+=threadNum) {
-      scalar_t4 vecA {reinterpret_cast<scalar_t4*>(&A[row * totalCol + col * 4])[0]};
-      diff = vecA.x - rowMean;
-      rowVar += diff * diff;
-      diff = vecA.y - rowMean;
-      rowVar += diff * diff;
-      diff = vecA.z - rowMean;
-      rowVar += diff * diff;
-      diff = vecA.w - rowMean;
-      rowVar += diff * diff;
+      // scalar_t4 vecA {reinterpret_cast<scalar_t4*>(&A[row * totalCol + col * 4])[0]};
+      // diff = vecA.x - rowMean;
+      // rowVar += diff * diff;
+      // diff = vecA.y - rowMean;
+      // rowVar += diff * diff;
+      // diff = vecA.z - rowMean;
+      // rowVar += diff * diff;
+      // diff = vecA.w - rowMean;
+      // rowVar += diff * diff;
 
+
+      scalar_t x  = smemA[threadIdx.y * totalCol / 4 * 5 + col * 5];
+      scalar_t y  = smemA[threadIdx.y * totalCol / 4 * 5 + col * 5 + 1];
+      scalar_t z  = smemA[threadIdx.y * totalCol / 4 * 5 + col * 5 + 2];
+      scalar_t w  = smemA[threadIdx.y * totalCol / 4 * 5 + col * 5 + 3];
+
+      diff = x - rowMean;
+      rowVar += diff * diff;
+      diff = y - rowMean;
+      rowVar += diff * diff;
+      diff = z - rowMean;
+      rowVar += diff * diff;
+      diff = w - rowMean;
+      rowVar += diff * diff;
 
     }
     // warp树形规约
@@ -207,12 +239,20 @@ __global__ void LayerNorm_kernel_warp_reduction_unroll_SMEM(const scalar_i total
     __syncthreads();
 
     rowVar = reduction[threadIdx.y][0];
-    rstd[row] = rowVar;
+    // rstd[row] = rowVar;
+    __stcs(rstd + row,rowVar);
 
 #pragma Unroll URF
     // 对行元素进行归一化
     for (scalar_i col {threadIDX}; col< totalCol / 4; col+=threadNum) {
-      scalar_t4 vecA {reinterpret_cast<scalar_t4*>(&A[row * totalCol + col * 4])[0]};
+      scalar_t4 vecA {};
+
+      // 每行元素复用
+      vecA.x  = smemA[threadIdx.y * totalCol / 4 * 5 + col * 5];
+      vecA.y  = smemA[threadIdx.y * totalCol / 4 * 5 + col * 5 + 1];
+      vecA.z  = smemA[threadIdx.y * totalCol / 4 * 5 + col * 5 + 2];
+      vecA.w  = smemA[threadIdx.y * totalCol / 4 * 5 + col * 5 + 3];
+
       //smemWeight、smemBias没有任何复用，GMEM加载没有少，反而多了一次从SMEM加载的开销。
       vecA.x = smemWeight[col][0] * ((vecA.x - rowMean) * rowVar) + smemBias[col][0];
       vecA.y = smemWeight[col][1] * ((vecA.y - rowMean) * rowVar) + smemBias[col][1];

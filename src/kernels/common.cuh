@@ -13,12 +13,12 @@
 
 
 #ifndef BLOCK_SIZE_X_SMEM
-#define BLOCK_SIZE_X_SMEM 512
+#define BLOCK_SIZE_X_SMEM 256
 #endif
 
 
 #ifndef BLOCK_SIZE_Y_SMEM
-#define BLOCK_SIZE_Y_SMEM 2
+#define BLOCK_SIZE_Y_SMEM 4
 #endif
 
 #ifndef MAX_TOTALCOL
