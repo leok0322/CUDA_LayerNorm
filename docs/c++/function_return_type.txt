@@ -1,0 +1,110 @@
+================================================================================
+  C++ 函数返回类型唯一性：裸 return; 的问题与修复方案
+================================================================================
+
+--------------------------------------------------------------------------------
+一、规则：函数返回类型唯一
+--------------------------------------------------------------------------------
+
+  C++ 函数只能有一个声明返回类型，所有 return 语句必须与该类型一致：
+    · 返回 void    → 可以裸 return; 或省略 return
+    · 返回非 void  → 每条 return 语句都必须携带匹配类型的值；裸 return; 非法
+
+  示例：
+    torch::Tensor foo() {
+        if (bad) return;           // ✗ warning #117-D: non-void function should return a value
+        return torch::empty({});   // ✓
+    }
+
+  为什么不能有两种返回类型：
+    函数调用方在编译期就确定了如何处理返回值（寄存器分配、ABI 调用约定）。
+    若同一函数某条路径返回 Tensor、另一条返回 void，调用方无法生成一致的代码。
+
+--------------------------------------------------------------------------------
+二、裸 return; 的常见场景及修复方案
+--------------------------------------------------------------------------------
+
+  场景：SMEM 超限时提前退出
+
+  ── 方案 A：抛异常（推荐）────────────────────────────────────────────────────
+
+    if (static_smem + dynSmem > SM86_PER_BLOCK_MAX) {
+        throw std::runtime_error(
+            "[kernel6] dynSmem 超过 sm_86 per-block 上限 (99 KB)");
+    }
+
+    优点：
+      · 错误立即冒泡，调用方无需检查返回值
+      · 经 pybind11 自动转换为 Python 的 RuntimeError，信息清晰
+      · 符合"异常用于程序员错误 / 配置错误"的语义
+
+  ── 方案 B：返回空张量 ────────────────────────────────────────────────────────
+
+    if (static_smem + dynSmem > SM86_PER_BLOCK_MAX) {
+        return torch::Tensor{};   // 默认构造 = undefined/empty 张量
+    }
+
+    调用方需主动检查：
+      auto out = LayerNorm_cuda.LayerNorm(x);
+      if (!out.defined()) { /* 处理跳过情况 */ }
+
+    缺点：调用方容易忘记检查，静默失败难以发现。
+
+  本项目选用方案 A（throw），理由：
+    SMEM 超限是配置错误（totalCol 或 BLOCK_SIZE_Y 选择不当），
+    不是正常控制流，应立即报错而不是静默返回。
+
+--------------------------------------------------------------------------------
+三、pybind11 的异常传递机制
+--------------------------------------------------------------------------------
+
+  pybind11 会在 C++ → Python 调用边界自动捕获 C++ 异常并转换：
+
+    C++ 异常类型                →  Python 异常类型
+    ─────────────────────────────────────────────
+    std::runtime_error          →  RuntimeError
+    std::invalid_argument       →  ValueError
+    std::out_of_range           →  IndexError
+    std::bad_alloc              →  MemoryError
+    std::exception（其他）      →  RuntimeError
+
+  传递过程：
+    1. C++ kernel 代码抛出 std::runtime_error("消息")
+    2. pybind11 边界捕获，调用 PyErr_SetString(PyExc_RuntimeError, "消息")
+    3. Python 侧收到 RuntimeError，.args[0] 即为原始消息字符串
+
+  无需在 C++ 侧做任何额外处理，pybind11 自动完成转换。
+
+--------------------------------------------------------------------------------
+四、Python 侧配合方案
+--------------------------------------------------------------------------------
+
+  catch RuntimeError，打印错误信息，记录 SKIP 并继续下一个尺寸：
+
+    try:
+        out = LayerNorm_cuda.LayerNorm(x)
+    except RuntimeError as e:
+        print(f"{rows}x{cols}  SKIP  {e}")
+        results.append((rows, cols, None, None, "SKIP"))
+        continue
+
+  计时阶段同样需要保护（warmup 也会触发异常）：
+
+    try:
+        t_cuda = benchmark(lambda: LayerNorm_cuda.LayerNorm(x))
+    except RuntimeError as e:
+        print(f"{rows}x{cols}  SKIP (benchmark)  {e}")
+        results.append((rows, cols, None, None, "SKIP"))
+        continue
+
+  结果写入时区分三种状态：
+
+    for rows, cols, t_cuda, t_torch, ok in results:
+        if ok == "SKIP":
+            lines.append(f"  {rows}x{cols}  SKIP (RuntimeError)")
+        elif not ok:
+            lines.append(f"  {rows}x{cols}  FAIL")
+        else:
+            # 正常写入性能数据
+
+================================================================================

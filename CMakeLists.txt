@@ -102,7 +102,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #      #define LAYERNORM_VARIANT 1
 # 注意：修改此文件中的默认值不会覆盖 CMakeCache.txt 中的已有值，
 #       需删除 CMakeCache.txt 或显式传 -D 才能让修改生效
-set(LAYERNORM_VARIANT 1 CACHE STRING "LayerNorm kernel variant (1-N), matches kernel implementation")
+set(LAYERNORM_VARIANT 6 CACHE STRING "LayerNorm kernel variant (1-N), matches kernel implementation")
 set(BLOCK_SIZE        1024 CACHE STRING "CUDA block size (threads per block), power of 2 in [32, 1024]")
 
 message(STATUS "Kernel config: LAYERNORM_VARIANT=${LAYERNORM_VARIANT}  BLOCK_SIZE=${BLOCK_SIZE}")

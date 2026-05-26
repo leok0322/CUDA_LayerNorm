@@ -1,0 +1,131 @@
+================================================================================
+  Torch C++ 张量创建：常用 API 与 TensorOptions 详解
+================================================================================
+
+--------------------------------------------------------------------------------
+一、TensorOptions：x.options() 解析
+--------------------------------------------------------------------------------
+
+  torch::TensorOptions 是一个不可变的配置对象，记录张量的四个属性：
+    ┌──────────────┬──────────────────────────────┬──────────────────────────┐
+    │ 属性         │ 类型                         │ 说明                     │
+    ├──────────────┼──────────────────────────────┼──────────────────────────┤
+    │ dtype        │ torch::ScalarType            │ 元素类型（float/int/...） │
+    │ device       │ torch::Device                │ 设备（cpu / cuda:0 等）  │
+    │ layout       │ torch::Layout                │ 内存布局（通常 Strided） │
+    │ requires_grad│ bool                         │ 是否参与自动微分          │
+    └──────────────┴──────────────────────────────┴──────────────────────────┘
+
+  x.options() 将 x 的四个属性打包成一个 TensorOptions，等价于：
+
+    torch::TensorOptions()
+        .dtype(x.dtype())
+        .device(x.device())
+        .layout(x.layout())
+        .requires_grad(x.requires_grad())
+
+  用途：把 x 的属性"继承"给新张量，保证 dtype/device 一致，避免类型不匹配错误。
+
+  示例：
+    auto x = torch::randn({4, 128}, torch::device(torch::kCUDA).dtype(torch::kFloat));
+    // mean 与 x 同 dtype（float）、同 device（cuda:0）
+    auto mean = torch::empty({4}, x.options());
+
+  单独构造 TensorOptions：
+    auto opts = torch::TensorOptions()
+                    .dtype(torch::kFloat32)
+                    .device(torch::kCUDA, 0);   // cuda:0
+    auto t = torch::zeros({128}, opts);
+
+--------------------------------------------------------------------------------
+二、常用张量创建函数
+--------------------------------------------------------------------------------
+
+  所有创建函数的签名形如：
+    torch::Tensor torch::<func>(IntArrayRef sizes, TensorOptions options = {})
+
+  2.1 内容初始化
+  ──────────────
+    torch::empty({M, N}, opts)    // 未初始化，最快，内容不确定
+    torch::zeros({M, N}, opts)    // 全 0
+    torch::ones ({M, N}, opts)    // 全 1
+    torch::full ({M, N}, 3.14f, opts)  // 全填充为指定值
+
+  2.2 随机初始化
+  ──────────────
+    torch::rand ({M, N}, opts)    // 均匀分布 [0, 1)，仅支持浮点类型
+    torch::randn({M, N}, opts)    // 标准正态分布 N(0,1)，仅支持浮点类型
+
+  2.3 序列 / 区间
+  ────────────────
+    torch::arange(start, end, step, opts)   // [start, end)，步长 step
+    torch::arange(N, opts)                  // 等价 arange(0, N, 1)
+    torch::linspace(start, end, steps, opts)// [start, end] 均分 steps 个点
+
+    示例：
+      torch::arange(0, 8, 2, opts)  // → [0, 2, 4, 6]
+      torch::linspace(0.f, 1.f, 5, opts)  // → [0.0, 0.25, 0.5, 0.75, 1.0]
+
+  2.4 特殊形状
+  ────────────
+    torch::eye(N, opts)           // N×N 单位矩阵
+    torch::eye(M, N, opts)        // M×N，对角线为 1
+
+  2.5 形状继承（_like 系列）
+  ─────────────────────────
+    torch::empty_like(x)          // 与 x 同 shape/dtype/device，未初始化
+    torch::zeros_like(x)          // 与 x 同 shape/dtype/device，全 0
+    torch::ones_like (x)          // 与 x 同 shape/dtype/device，全 1
+    torch::full_like (x, val)     // 与 x 同 shape/dtype/device，全填充 val
+    torch::rand_like (x)          // 与 x 同 shape/dtype/device，均匀随机
+    torch::randn_like(x)          // 与 x 同 shape/dtype/device，正态随机
+
+    _like 等价于显式传 x.options() + x.sizes()：
+      torch::zeros_like(x)
+      // ≡ torch::zeros(x.sizes(), x.options())
+
+  2.6 从已有数据构造
+  ──────────────────
+    torch::from_blob(ptr, {M, N}, opts)
+      // 不拷贝数据，ptr 的生命周期必须长于返回的张量
+      // ptr 类型需与 opts.dtype() 匹配
+
+    示例（host float 数组 → CPU 张量）：
+      float data[4] = {1.f, 2.f, 3.f, 4.f};
+      auto t = torch::from_blob(data, {4}, torch::kFloat);
+
+--------------------------------------------------------------------------------
+三、device 与 dtype 常量速查
+--------------------------------------------------------------------------------
+
+  dtype 常量：
+    torch::kFloat32 / torch::kFloat    // float（最常用）
+    torch::kFloat64 / torch::kDouble   // double
+    torch::kFloat16 / torch::kHalf     // half
+    torch::kInt32   / torch::kInt      // int32
+    torch::kInt64   / torch::kLong     // int64
+
+  device 常量：
+    torch::kCPU                        // CPU
+    torch::kCUDA                       // 默认 CUDA 设备（cuda:0）
+    torch::device(torch::kCUDA, 1)     // 指定 cuda:1
+
+--------------------------------------------------------------------------------
+四、LayerNorm 场景示例
+--------------------------------------------------------------------------------
+
+  // x: [totalRow, totalCol]，float，cuda:0
+  int64_t totalRow = x.size(0);
+  int64_t totalCol = x.size(1);
+
+  // 继承 x 的 dtype 和 device
+  auto mean   = torch::empty({totalRow}, x.options());  // 每行均值，未初始化
+  auto rstd   = torch::empty({totalRow}, x.options());  // 每行 1/sqrt(var+ε)
+  auto weight = torch::ones ({totalCol}, x.options());  // γ，初始值 1
+  auto bias   = torch::zeros({totalCol}, x.options());  // β，初始值 0
+
+  // 访问裸指针（传给 kernel）
+  float* mean_ptr   = mean.data_ptr<float>();
+  float* weight_ptr = weight.data_ptr<float>();
+
+================================================================================

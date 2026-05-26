@@ -55,8 +55,11 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
   // 动态SMEM：单一声明，手动三路切分
   // 布局：[smemWeight: (totalCol/4)×5] [smemBias: (totalCol/4)×5] [smemA: BLOCK_SIZE_Y_SMEM×(totalCol/4)×5]
   // dynSmem = sizeof(scalar_t) * (totalCol/4) * 5 * (2 + BLOCK_SIZE_Y_SMEM)
-  extern __shared__ __align__(16) scalar_t smem[];
-  scalar_t (*smemWeight)[5] = reinterpret_cast<scalar_t(*)[5]>(smem);
+  // extern __shared__ 是翻译单元级全局符号：同一名称只能声明为一种类型。
+  // 若写 extern __shared__ scalar_t smem[]，float/double 两次实例化产生两种类型声明 → 冲突。
+  // 解法：始终用 char（类型唯一），再 reinterpret_cast 到目标类型。
+  extern __shared__ __align__(16) char smem_raw[];
+  scalar_t (*smemWeight)[5] = reinterpret_cast<scalar_t(*)[5]>(smem_raw);
   scalar_t (*smemBias)[5]   = smemWeight + totalCol / 4;
   //                          ↑ 偏移 totalCol/4 个 [5] 块，即跳过 smemWeight 的全部元素
   // smemA 紧接 smemBias 之后，flat index: [y][col][k] → y*(totalCol/4)*5 + col*5 + k

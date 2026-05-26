@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# SCRIPT_DIR：脚本自身所在目录的绝对路径
+#
+#   $0                    脚本的调用路径，如 ./benchmark_layernorm.sh
+#   dirname "$0"          取目录部分，如 . 或 /a/b
+#   cd "$(dirname "$0")"  cd 进该目录（处理相对路径）
+#   pwd                   打印当前目录的绝对路径
+#
+#   整体效果：无论从哪个目录调用此脚本，SCRIPT_DIR 始终是脚本文件所在的绝对路径。
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_FILE="$SCRIPT_DIR/logs/python_layernorm_test.log"
+
+mkdir -p "$SCRIPT_DIR/logs"
+
+# 激活虚拟环境，使 python / uv 使用 .venv 中的包
+source /home/liam/python_linux/python_venv/.venv/bin/activate
+
+# 2>&1        将 stderr 合并到 stdout（两路输出合为一路）
+# tee         将合并后的输出同时写入终端和日志文件
+uv run python "$SCRIPT_DIR/benchmark_layernorm.py" 2>&1 | tee "$LOG_FILE"
