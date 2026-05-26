@@ -29,6 +29,14 @@ LOGS_DIR = Path(__file__).parent / "logs"
 # 典型方阵维度（m == n）
 DEFAULT_DIMS = [128, 256, 512, 1024, 2048, 4096]
 
+# 典型非方阵维度（rows, cols）
+DEFAULT_NONSQUARE = [
+    (128,  4096),
+    (256,  4096),
+    (4096,  128),
+    (4096, 1024),
+]
+
 KERNEL_IDS = list(range(0, 12))   # kernel 0–11
 
 KERNEL_LABELS = {
@@ -108,14 +116,16 @@ def main() -> None:
     else:
         dims = DEFAULT_DIMS
 
-    # kernel 0 作为基准线，折线只画 kernel 1–9
+    # kernel 0 作为基准线，折线只画 kernel 1–11
     plot_kernels = [k for k in KERNEL_IDS if k != 0]
-    colors = [plt.cm.tab10(i) for i in range(len(dims))]
+    sq_colors   = [plt.cm.tab10(i) for i in range(len(dims))]
+    nsq_colors  = [plt.cm.Set2(i)  for i in range(len(DEFAULT_NONSQUARE))]
 
-    fig, ax = plt.subplots(figsize=(13, 7))
+    fig, ax = plt.subplots(figsize=(14, 7))
 
+    # ── 方阵折线（实线 + 圆形标记）────────────────────────────────────────────
     for i, dim in enumerate(dims):
-        color = colors[i]
+        color = sq_colors[i]
         key = (dim, dim)
 
         ys = [data.get(kid, {}).get(key) for kid in plot_kernels]
@@ -144,10 +154,32 @@ def main() -> None:
                 alpha=0.5,
             )
 
-    # 各 kernel 在所有绘制维度上的平均 GFLOPS
+    # ── 非方阵折线（点划线 + 三角形标记）─────────────────────────────────────
+    for i, (rows, cols) in enumerate(DEFAULT_NONSQUARE):
+        color = nsq_colors[i]
+        key = (rows, cols)
+
+        ys = [data.get(kid, {}).get(key) for kid in plot_kernels]
+        valid = [(kid, v) for kid, v in zip(plot_kernels, ys) if v is not None]
+        if not valid:
+            print(f"警告：维度 {rows}×{cols} 在所有 kernel 中均无数据，跳过", file=sys.stderr)
+            continue
+        xs, ys_valid = zip(*valid)
+        ax.plot(
+            xs, ys_valid,
+            label=f"{rows}×{cols}",
+            marker="^",
+            linewidth=1.5,
+            markersize=5,
+            color=color,
+            linestyle="-.",
+        )
+
+    # 各 kernel 在所有绘制维度（方阵 + 非方阵）上的平均 GFLOPS
+    all_keys = [(d, d) for d in dims] + DEFAULT_NONSQUARE
     avg_ys = []
     for kid in plot_kernels:
-        vals = [data.get(kid, {}).get((d, d)) for d in dims]
+        vals = [data.get(kid, {}).get(key) for key in all_keys]
         valid_vals = [v for v in vals if v is not None]
         avg_ys.append(sum(valid_vals) / len(valid_vals) if valid_vals else None)
 
@@ -164,10 +196,21 @@ def main() -> None:
             linestyle="--",
             zorder=5,
         )
+        for x, y in zip(xs_avg, ys_avg):
+            ax.annotate(
+                f"{y:.0f}",
+                xy=(x, y),
+                xytext=(0, 8),
+                textcoords="offset points",
+                ha="center",
+                fontsize=7,
+                color="black",
+                zorder=6,
+            )
 
     ax.set_xlabel("Kernel", fontsize=12)
     ax.set_ylabel("Performance (GFLOPS)", fontsize=12)
-    ax.set_title("CUDA LayerNorm Kernel Performance (m = n, K0–K11)", fontsize=14)
+    ax.set_title("CUDA LayerNorm Kernel Performance (K0–K11, ○ square  △ non-square)", fontsize=13)
     ax.set_xticks(plot_kernels)
     ax.set_xticklabels(
         [KERNEL_LABELS[k] for k in plot_kernels], rotation=25, ha="right"

@@ -4,32 +4,44 @@
 ================================================================================
 
 --------------------------------------------------------------------------------
-一、kernel 6 的问题：weight / bias 只由 threadIdx.y == 0 加载
+一、kernel 6 的演变与现状
 --------------------------------------------------------------------------------
 
-  kernel 6 在 A 的加载循环内，用 if 保护 weight/bias 的写入：
+  【原始版本】weight / bias 加载在 if 外，所有线程均执行：
 
     for (col = threadIDX; col < totalCol/4; col += threadNum) {
-        // 所有 BSX=256 条线程加载 A（按行，threadIdx.y 决定行号）
-        scalar_t4 vecA    = ...A[row * totalCol + col * 4]...;
-        scalar_t4 vecWeight = ...weight[col * 4]...;
-        scalar_t4 vecBias   = ...bias[col * 4]...;
+        scalar_t4 vecA      = ...A[row * totalCol + col * 4]...;
+        scalar_t4 vecWeight = ...weight[col * 4]...;   // ← 所有线程加载
+        scalar_t4 vecBias   = ...bias[col * 4]...;     // ← 所有线程加载
 
         rowMean += vecA.x + vecA.y + vecA.z + vecA.w;
 
-        if (threadIdx.y == 0) {    // ← 只有第 0 行写 smemWeight/smemBias
+        if (threadIdx.y == 0) {    // ← 只有第 0 行写 SMEM
             smemWeight[col][0..3] = vecWeight.x/y/z/w;
             smemBias  [col][0..3] = vecBias.x/y/z/w;
         }
     }
 
-  问题 1：threadIdx.y != 0 的线程加载了 weight/bias 但没有使用
-    BLOCK_SIZE_Y=2 时，threadIdx.y=1 的线程（warp 8~15）每轮都做了
-    4 次全局内存加载（vecWeight、vecBias），但不写 SMEM，这 8 次 load 全部浪费。
+    问题：threadIdx.y=1 的线程加载了 weight/bias 但结果被丢弃，
+          冗余 load 浪费指令和寄存器。
 
-  问题 2：只有 BLOCK_SIZE_X 条线程写 smemWeight/smemBias
-    BSX=256，BSY=2，block 共 512 条线程，但只有 threadIdx.y=0 的 256 条写 SMEM，
-    另外 256 条空转，内存请求密度只有潜在上限的 50%。
+  【修改后（当前版本）】weight / bias 加载移入 if 内：
+
+    for (col = threadIDX; col < totalCol/4; col += threadNum) {
+        scalar_t4 vecA = ...A[row * totalCol + col * 4]...;
+        rowMean += vecA.x + vecA.y + vecA.z + vecA.w;
+        smemA[...] = vecA;
+
+        if (threadIdx.y == 0) {    // ← load 和 store 均在 if 内
+            scalar_t4 vecWeight = ...weight[col * 4]...;
+            scalar_t4 vecBias   = ...bias[col * 4]...;
+            smemWeight[col][0..3] = vecWeight.x/y/z/w;
+            smemBias  [col][0..3] = vecBias.x/y/z/w;
+        }
+    }
+
+    冗余加载问题已消除，但仍只有 BSX = 256 条线程负责加载 weight/bias，
+    另外 256 条（threadIdx.y=1）不参与，内存请求密度仍为潜在上限的 50%。
 
 --------------------------------------------------------------------------------
 二、kernel 11 的改进：全 block 协作加载，独立循环
@@ -67,18 +79,19 @@
 --------------------------------------------------------------------------------
 
   ┌────────────────────────────────┬──────────────────────┬──────────────────────┐
-  │                                │ kernel 6             │ kernel 11            │
+  │                                │ kernel 6（修改后）   │ kernel 11            │
   ├────────────────────────────────┼──────────────────────┼──────────────────────┤
-  │ weight/bias 加载线程数          │ BLOCK_SIZE_X = 256   │ BSX × BSY = 512      │
+  │ weight/bias 加载线程数          │ BSX = 256            │ BSX × BSY = 512      │
   │ weight/bias 加载循环位置        │ A 加载循环内（if 内） │ 独立循环（if 外）    │
-  │ 无效 weight/bias load          │ BSY-1 行浪费         │ 无浪费               │
+  │ 冗余 weight/bias load          │ 无（已移入 if 消除）  │ 无                   │
   │ if (threadIdx.y == 0) 分支     │ 有（每轮判断）        │ 无                   │
-  │ A 加载循环的分支                │ 有（写 SMEM 分支）   │ 无                   │
+  │ A 加载循环的分支                │ 有（weight/bias 分支）│ 无                   │
+  │ 每线程循环迭代数（cols=4096）   │ 4 次                 │ 2 + 4 = 6 次         │
   └────────────────────────────────┴──────────────────────┴──────────────────────┘
 
   并发内存请求密度（weight/bias 加载阶段）：
-    kernel 6 ：256 条线程并发发出 ld.global（只有 threadIdx.y=0 的 warp）
-    kernel 11：512 条线程并发发出 ld.global（全部 warp），延迟隐藏能力更强
+    kernel 6 ：256 条线程（8 warp）并发发出 ld.global
+    kernel 11：512 条线程（16 warp）并发发出 ld.global，L2 带宽利用率和延迟隐藏更强
 
 --------------------------------------------------------------------------------
 四、同步位置说明
@@ -185,6 +198,13 @@
     · 小 rows（≤512）+ 中大 cols：kernel 11 普遍领先，最大差距达 +51%
     · 大 rows（≥2048）+ 大 cols：kernel 6 持平或略优（最大 +9%）
     · 1024×1024 及以上大方阵：kernel 6 略占优
+
+    整体平均（10 个典型维度，sm_86）：
+      kernel 6  = 166.0 GFLOPS
+      kernel 11 = 168.2 GFLOPS
+      差距       = +2.2 GFLOPS（+1.3%）
+    两者整体性能无本质差距，kernel 11 的全 block 协作加载改进在平均意义下
+    未带来显著收益，优势仅体现在特定维度（小 rows + 中大 cols）。
 
   原因 1：weight / bias 加载线程数差距（小矩阵时 K11 优势的主因）
     kernel 6（修改后）：weight/bias 由 if (threadIdx.y == 0) 保护，
