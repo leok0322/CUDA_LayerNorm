@@ -73,6 +73,7 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM_advanced(cons
   scalar_t rowMean {};
   if (row < totalRow) {
 
+#pragma unroll URF
     for (scalar_i col {threadIdxForLoadWeightAndBias}; col< totalCol / 4; col+=threadNumForLoadWeightAndBias) {
       // 单独加载weight、bias
       scalar_t4 vecWeight = reinterpret_cast<scalar_t4*>(&weight[col * 4])[0];

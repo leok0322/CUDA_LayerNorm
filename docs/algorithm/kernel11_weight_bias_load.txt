@@ -1,0 +1,227 @@
+================================================================================
+  Kernel 11：weight / bias 全 block 协作加载
+  ── 相对 kernel 6 的改进
+================================================================================
+
+--------------------------------------------------------------------------------
+一、kernel 6 的问题：weight / bias 只由 threadIdx.y == 0 加载
+--------------------------------------------------------------------------------
+
+  kernel 6 在 A 的加载循环内，用 if 保护 weight/bias 的写入：
+
+    for (col = threadIDX; col < totalCol/4; col += threadNum) {
+        // 所有 BSX=256 条线程加载 A（按行，threadIdx.y 决定行号）
+        scalar_t4 vecA    = ...A[row * totalCol + col * 4]...;
+        scalar_t4 vecWeight = ...weight[col * 4]...;
+        scalar_t4 vecBias   = ...bias[col * 4]...;
+
+        rowMean += vecA.x + vecA.y + vecA.z + vecA.w;
+
+        if (threadIdx.y == 0) {    // ← 只有第 0 行写 smemWeight/smemBias
+            smemWeight[col][0..3] = vecWeight.x/y/z/w;
+            smemBias  [col][0..3] = vecBias.x/y/z/w;
+        }
+    }
+
+  问题 1：threadIdx.y != 0 的线程加载了 weight/bias 但没有使用
+    BLOCK_SIZE_Y=2 时，threadIdx.y=1 的线程（warp 8~15）每轮都做了
+    4 次全局内存加载（vecWeight、vecBias），但不写 SMEM，这 8 次 load 全部浪费。
+
+  问题 2：只有 BLOCK_SIZE_X 条线程写 smemWeight/smemBias
+    BSX=256，BSY=2，block 共 512 条线程，但只有 threadIdx.y=0 的 256 条写 SMEM，
+    另外 256 条空转，内存请求密度只有潜在上限的 50%。
+
+--------------------------------------------------------------------------------
+二、kernel 11 的改进：全 block 协作加载，独立循环
+--------------------------------------------------------------------------------
+
+  2.1 新增平铺线程索引
+  ─────────────────────
+    // 将二维线程号展开为一维，覆盖 block 内所有线程
+    scalar_i threadIdxForLoadWeightAndBias { threadIdx.y * blockDim.x + threadIdx.x };
+    scalar_i threadNumForLoadWeightAndBias { blockDim.y  * blockDim.x };
+
+    BSX=256, BSY=2：threadNumForLoadWeightAndBias = 512
+    线程 0..255（threadIdx.y=0）和线程 256..511（threadIdx.y=1）全部参与加载。
+
+  2.2 独立的 weight / bias 加载循环（在 A 加载循环之前）
+  ─────────────────────────────────────────────────────
+    for (col = threadIdxForLoadWeightAndBias; col < totalCol/4;
+         col += threadNumForLoadWeightAndBias) {
+        scalar_t4 vecWeight = ...weight[col * 4]...;
+        scalar_t4 vecBias   = ...bias[col * 4]...;
+        smemWeight[col][0..3] = vecWeight.x/y/z/w;
+        smemBias  [col][0..3] = vecBias.x/y/z/w;
+    }
+
+    随后的 A 加载循环去掉了 if (threadIdx.y == 0) 分支：
+    for (col = threadIDX; col < totalCol/4; col += threadNum) {
+        scalar_t4 vecA = ...A[row * totalCol + col * 4]...;
+        rowMean += vecA.x + vecA.y + vecA.z + vecA.w;
+        smemA[threadIdx.y * totalCol/4 * 5 + col * 5 + 0..3] = vecA.x/y/z/w;
+        // ← 无 if (threadIdx.y == 0)，代码更简洁
+    }
+
+--------------------------------------------------------------------------------
+三、改进效果对比
+--------------------------------------------------------------------------------
+
+  ┌────────────────────────────────┬──────────────────────┬──────────────────────┐
+  │                                │ kernel 6             │ kernel 11            │
+  ├────────────────────────────────┼──────────────────────┼──────────────────────┤
+  │ weight/bias 加载线程数          │ BLOCK_SIZE_X = 256   │ BSX × BSY = 512      │
+  │ weight/bias 加载循环位置        │ A 加载循环内（if 内） │ 独立循环（if 外）    │
+  │ 无效 weight/bias load          │ BSY-1 行浪费         │ 无浪费               │
+  │ if (threadIdx.y == 0) 分支     │ 有（每轮判断）        │ 无                   │
+  │ A 加载循环的分支                │ 有（写 SMEM 分支）   │ 无                   │
+  └────────────────────────────────┴──────────────────────┴──────────────────────┘
+
+  并发内存请求密度（weight/bias 加载阶段）：
+    kernel 6 ：256 条线程并发发出 ld.global（只有 threadIdx.y=0 的 warp）
+    kernel 11：512 条线程并发发出 ld.global（全部 warp），延迟隐藏能力更强
+
+--------------------------------------------------------------------------------
+四、同步位置说明
+--------------------------------------------------------------------------------
+
+  weight/bias 的独立加载循环仍在 if (row < totalRow) 内部：
+
+    if (row < totalRow) {
+        for (col = threadIdxForLoadWeightAndBias; ...) {
+            smemWeight / smemBias 写入
+        }
+
+        for (col = threadIDX; ...) {    // A 加载，rowMean 累加，smemA 写入
+            ...
+        }
+        // 一级 warp 规约，写 reduction[]
+    }
+
+    __syncthreads();    // ← sync 1，保护 smemWeight/smemBias/smemA/reduction
+                        //   在 if 外，越界行线程也能到达，不会死锁
+
+  weight/bias 和 smemA 共享同一个 __syncthreads()，
+  因为它们都在 phase1 内完成，phase2 开始前统一同步一次即可。
+
+================================================================================
+
+
+
+
+================================================================================
+  Kernel 11 vs Kernel 6（修改后）：weight / bias 全 block 协作加载的性能影响
+================================================================================
+
+--------------------------------------------------------------------------------
+一、实现差异（基于修改后的 kernel 6）
+--------------------------------------------------------------------------------
+
+  kernel 6（修改后）：weight / bias 加载移入 if (threadIdx.y == 0) 内
+    for col in threadIDX..totalCol/4 step BSX:
+        vecA = load A[row, col]              // 所有线程
+        rowMean += vecA; smemA[y][col] = vecA
+        if threadIdx.y == 0:
+            vecWeight = load weight[col]     // 只有 threadIdx.y=0 的线程加载（BSX 条）
+            vecBias   = load bias[col]
+            smemWeight[col] = vecWeight
+            smemBias[col]   = vecBias
+
+    weight/bias 由 BSX = 256 条线程加载（占 block 的 50%）
+    无冗余加载；A / weight / bias 仍在同一循环内（access fusion 保留）
+
+  kernel 11：weight / bias 独立循环，全部 BSX×BSY 线程协作加载
+    for col in threadIdxFlat..totalCol/4 step BSX*BSY:
+        smemWeight[col] = load weight[col]   // 全部 512 条线程，每列只加载一次
+        smemBias[col]   = load bias[col]
+
+    for col in threadIDX..totalCol/4 step BSX:
+        vecA = load A[row, col]
+        smemA[y][col] = vecA                 // A 加载单独循环，无 if 分支
+
+    weight/bias 由 BSX×BSY = 512 条线程加载（占 block 的 100%）
+    两个循环串行执行，A / weight / bias 访问不融合
+
+  注意：当 totalCol/4 ≤ BSX×BSY = 512 时，kernel 11 中 threadIdxFlat ≥ totalCol/4
+        的线程实际不发出加载（循环条件不成立），参与线程数退化到 totalCol/4 条。
+
+--------------------------------------------------------------------------------
+二、性能数据（m=n 方阵，GFLOPS，sm_86）
+--------------------------------------------------------------------------------
+
+  ┌──────────────┬──────────┬──────────┬──────────────────────────┐
+  │ (rows, cols) │ kernel 6 │ kernel 11│ 说明                     │
+  ├──────────────┼──────────┼──────────┼──────────────────────────┤
+  │  128 ×  128  │   15.8   │   16.9   │ K11 +7%                  │
+  │  256 ×  256  │   54.9   │   57.3   │ K11 +4%                  │
+  │  512 ×  512  │  138.9   │  201.3   │ K11 +45%                 │
+  │ 1024 × 1024  │  237.9   │  227.2   │ K6  +5%                  │
+  │ 2048 × 2048  │  257.4   │  256.1   │ 基本持平                 │
+  │ 4096 × 4096  │  264.5   │  243.6   │ K6  +9%                  │
+  └──────────────┴──────────┴──────────┴──────────────────────────┘
+
+--------------------------------------------------------------------------------
+三、典型非方阵维度（GFLOPS）
+--------------------------------------------------------------------------------
+
+  ┌──────────────┬──────────┬──────────┬──────────────────────────┐
+  │ (rows, cols) │ kernel 6 │ kernel 11│ 说明                     │
+  ├──────────────┼──────────┼──────────┼──────────────────────────┤
+  │  128 ×  512  │   57.7   │   77.2   │ K11 +34%                 │
+  │  128 × 2048  │  151.0   │  227.3   │ K11 +51%                 │
+  │  128 × 4096  │  161.4   │  181.5   │ K11 +12%                 │
+  │  256 × 1024  │  170.6   │  216.7   │ K11 +27%                 │
+  │  256 × 4096  │  189.5   │  199.4   │ K11 +5%                  │
+  │ 4096 ×  128  │   86.6   │   87.0   │ 基本持平                 │
+  │ 4096 × 1024  │  259.3   │  256.9   │ 基本持平                 │
+  │ 4096 × 4096  │  264.5   │  243.6   │ K6  +9%                  │
+  └──────────────┴──────────┴──────────┴──────────────────────────┘
+
+--------------------------------------------------------------------------------
+四、结论与原因分析
+--------------------------------------------------------------------------------
+
+  结论：
+    修改后 kernel 6 的性能格局发生了变化：
+    · 小 rows（≤512）+ 中大 cols：kernel 11 普遍领先，最大差距达 +51%
+    · 大 rows（≥2048）+ 大 cols：kernel 6 持平或略优（最大 +9%）
+    · 1024×1024 及以上大方阵：kernel 6 略占优
+
+  原因 1：weight / bias 加载线程数差距（小矩阵时 K11 优势的主因）
+    kernel 6（修改后）：weight/bias 由 if (threadIdx.y == 0) 保护，
+                         只有 BSX = 256 条线程（8 warp）负责加载；
+    kernel 11          ：全部 BSX × BSY = 512 条线程（16 warp）参与，
+                         并发发出的 ld.global 数量是 kernel 6 的两倍。
+
+    更多并发线程带来两个独立收益：
+
+    收益 a：延迟隐藏（latency hiding）
+      更多 in-flight 请求使 SM 调度器在等待某笔数据返回时有更多备用请求可执行，
+      在 occupancy 低（block 数少、可切换 warp 少）时尤为关键。
+
+    收益 b：内存读取吞吐（memory throughput）
+      GPU 内存子系统（L2 cache / 内存控制器）能同时处理的请求数有上限。
+      weight / bias 被所有 block 共享，通常命中 L2 cache，瓶颈是 L2 带宽。
+      16 warp 并发发射请求比 8 warp 更充分地占满 L2 请求队列，
+      相同数据量在更短时间内完成读取，而非仅靠延迟隐藏来弥补等待。
+
+    当 rows 小（block 数少）时，两个收益都更显著，kernel 11 的优势更明显。
+
+    当 totalCol/4 ≤ 512 时（如 cols=1024 时 totalCol/4=256），
+    kernel 11 中 threadIdxFlat ≥ 256 的线程不实际加载，
+    两者参与线程数相同，kernel 11 的这一优势消失。
+
+  原因 2：独立循环带来额外循环开销（大矩阵时 K6 优势的主因）
+    以 4096×4096（totalCol/4=1024）为例，每条线程的循环次数：
+      kernel 6 ：1 个融合循环，1024 / 256 = 4 次迭代（A + weight + bias 一并处理）
+      kernel 11：weight/bias 循环 1024 / 512 = 2 次 + A 循环 1024 / 256 = 4 次 = 共 6 次
+
+    kernel 11 每条线程多执行 2 次迭代，每次迭代都有 loop counter 递增、
+    边界检查、地址计算等指令开销。
+
+    大矩阵（rows 大）时 SM occupancy 高，TLP 已将内存延迟充分隐藏，
+    瓶颈从"等待数据"转移到指令发射吞吐。此时 kernel 11 多出的循环指令开销
+    在总执行时间中占比上升，成为两者差距的主要来源。
+    kernel 6 用更少的迭代完成相同的内存工作，指令效率更高。
+
+================================================================================
+

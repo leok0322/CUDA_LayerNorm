@@ -78,8 +78,6 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
       // totalCol是4的倍数，16字节对齐
       // reinterpret_cast cannot cast away const or other type qualifiers，A不能是const指针
       scalar_t4 vecA    = reinterpret_cast<scalar_t4*>(&A[row * totalCol + col * 4])[0];
-      scalar_t4 vecWeight = reinterpret_cast<scalar_t4*>(&weight[col * 4])[0];
-      scalar_t4 vecBias   = reinterpret_cast<scalar_t4*>(&bias[col * 4])[0];
 
       // // A：每行读一次不复用，.cs hint 令数据加载后快速逐出 L1，避免污染 cache
       // scalar_t4 vecA;
@@ -109,6 +107,8 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
 
 
       if (threadIdx.y == 0) {
+        scalar_t4 vecWeight = reinterpret_cast<scalar_t4*>(&weight[col * 4])[0];
+        scalar_t4 vecBias   = reinterpret_cast<scalar_t4*>(&bias[col * 4])[0];
         // ── bank conflict 分析 ────────────────────────────────────────────────
         // SMEM 有 32 个 bank，每 bank 宽 4 字节，bank 编号 = 元素下标 % 32
         // 线程 t 写 smemWeight[t*4]，对应 bank = (t*4) % 32：
