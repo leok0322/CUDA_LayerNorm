@@ -29,7 +29,7 @@ LOGS_DIR = Path(__file__).parent / "logs"
 # 典型方阵维度（m == n）
 DEFAULT_DIMS = [128, 256, 512, 1024, 2048, 4096]
 
-KERNEL_IDS = list(range(0, 11))   # kernel 0–10
+KERNEL_IDS = list(range(0, 12))   # kernel 0–11
 
 KERNEL_LABELS = {
     0:  "K0 base",
@@ -43,6 +43,7 @@ KERNEL_LABELS = {
     8:  "K8 cooperative_groups_block",
     9:  "K9 cooperative_warp_advanced",
     10: "K10 warp_reduction_unroll_SMEM",
+    11: "K11 double_warp_reduction_unroll_SMEM_adv",
 }
 
 
@@ -67,7 +68,7 @@ def parse_log(kernel_id: int) -> dict[tuple[int, int], float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="绘制 LayerNorm kernel 0–10 在方阵维度上的 GFLOPS 折线图"
+        description="绘制 LayerNorm kernel 0–11 在方阵维度上的 GFLOPS 折线图"
     )
     parser.add_argument(
         "dims",
@@ -166,7 +167,7 @@ def main() -> None:
 
     ax.set_xlabel("Kernel", fontsize=12)
     ax.set_ylabel("Performance (GFLOPS)", fontsize=12)
-    ax.set_title("CUDA LayerNorm Kernel Performance (m = n)", fontsize=14)
+    ax.set_title("CUDA LayerNorm Kernel Performance (m = n, K0–K11)", fontsize=14)
     ax.set_xticks(plot_kernels)
     ax.set_xticklabels(
         [KERNEL_LABELS[k] for k in plot_kernels], rotation=25, ha="right"
