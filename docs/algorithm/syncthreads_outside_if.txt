@@ -1,0 +1,121 @@
+================================================================================
+  __syncthreads() 与边界条件：为什么不能在 if (row < totalRow) 内同步
+================================================================================
+
+--------------------------------------------------------------------------------
+一、问题：__syncthreads() 在 if 内部导致死锁
+--------------------------------------------------------------------------------
+
+  kernel 6 的 block 在 y 维度处理多行（BLOCK_SIZE_Y_SMEM = 2）：
+    blockIdx.y = last_block 时，可能存在越界行（row >= totalRow）
+
+  示例：totalRow = 3，BLOCK_SIZE_Y = 2
+    block 0：row=0（有效），row=1（有效）→ 两行都进入 if
+    block 1：row=2（有效），row=3（越界）→ 只有 row=2 进入 if
+
+  错误写法：
+    if (row < totalRow) {
+        // ... 计算 ...
+        __syncthreads();   // ← 越界行的线程跳过整个 if，永远到不了这里
+        // ... 读 SMEM ...
+    }
+
+  block 1 中：
+    row=2 的线程：进入 if，执行到 __syncthreads()，等待
+    row=3 的线程：跳过 if，永远不执行 __syncthreads()
+    → row=2 的线程永久等待 → 死锁（GPU hang）
+
+  CUDA 规定：__syncthreads() 必须被 block 内所有线程无条件执行，
+  否则行为未定义（实践中表现为死锁或错误结果）。
+
+--------------------------------------------------------------------------------
+二、解法：phase 拆分 + __syncthreads() 移至 if 外层
+--------------------------------------------------------------------------------
+
+  核心原则：
+    1. 将 kernel 拆成若干 phase，每个 phase 有自己的 if (row < totalRow) 保护
+    2. __syncthreads() 放在相邻两个 phase 之间，不在任何 if 内
+    3. 跨 phase 共享的局部变量（rowMean、rowVar）声明在所有 if 外部
+
+  结构模板：
+
+    scalar_t rowMean {};   // ← 在所有 if 之外声明，供各 phase 共享
+    scalar_t rowVar  {};
+
+    // phase 1：加载数据，写 SMEM，一级 warp 规约
+    if (row < totalRow) {
+        // ... 循环加载 A/weight/bias，累加 rowMean，写 smemA/smemWeight/smemBias
+        // ... warp 树形规约（一级）
+        if (threadIDX % 32 == 0) reduction[threadIdx.y][threadIDX / 32] = rowMean;
+    }
+    __syncthreads();   // ← 所有线程到达，包括越界行
+
+    // phase 2：warp0 二级规约，广播 mean
+    if (row < totalRow) {
+        if (threadIDX < 32) { rowMean = reduction[threadIdx.y][threadIDX]; /* 规约 */ }
+        if (threadIDX == 0) { rowMean /= totalCol; reduction[threadIdx.y][0] = rowMean; }
+    }
+    __syncthreads();
+
+    // phase 3：读 mean，计算方差，一级 warp 规约
+    if (row < totalRow) {
+        rowMean = reduction[threadIdx.y][0];
+        // ... 方差循环（读 smemA）
+        // ... warp 树形规约（一级）
+        if (threadIDX % 32 == 0) reduction[threadIdx.y][threadIDX / 32] = rowVar;
+    }
+    __syncthreads();
+
+    // phase 4：warp0 二级规约，广播 rstd
+    if (row < totalRow) {
+        if (threadIDX < 32) { rowVar = reduction[threadIdx.y][threadIDX]; /* 规约 */ }
+        if (threadIDX == 0) { rowVar = rsqrtf(rowVar / totalCol + 1e-5f); reduction[threadIdx.y][0] = rowVar; }
+    }
+    __syncthreads();
+
+    // phase 5：归一化写回（读 smemA/smemWeight/smemBias）
+    if (row < totalRow) {
+        rowVar = reduction[threadIdx.y][0];
+        // ... 归一化循环，写 out
+    }
+
+--------------------------------------------------------------------------------
+三、kernel 6 实际同步点分布
+--------------------------------------------------------------------------------
+
+  kernel 6 共有 4 次 __syncthreads()，全部位于 if 外层：
+
+  sync 1（phase1 → phase2）：
+    保护目标：reduction[]（一级 warp 规约结果）
+              smemWeight / smemBias（threadIdx.y==0 写，其他行读）
+              smemA（每行独立写，但后续 phase 读同一行数据，无跨行依赖，
+                    仍需 sync 保证写完成后才读）
+    位置：第一个 for 循环 + 一级规约结束后
+
+  sync 2（phase2 → phase3）：
+    保护目标：reduction[threadIdx.y][0]（threadIDX==0 写入最终 mean）
+    位置：二级规约写回 reduction[0] 后
+
+  sync 3（phase3 → phase4）：
+    保护目标：reduction[]（方差一级规约结果）
+    位置：方差 for 循环 + 一级规约结束后
+
+  sync 4（phase4 → phase5）：
+    保护目标：reduction[threadIdx.y][0]（threadIDX==0 写入最终 rstd）
+    位置：二级规约写回 reduction[0] 后
+
+--------------------------------------------------------------------------------
+四、越界行线程的行为
+--------------------------------------------------------------------------------
+
+  越界行线程（row >= totalRow）：
+    · 跳过所有 if (row < totalRow) 内的计算
+    · 仍然执行每个 __syncthreads()（因为在 if 外）
+    · 不读写任何 SMEM（所有 SMEM 访问都在 if 内）
+    · 不产生任何副作用，也不干扰有效行的计算
+
+  这是 CUDA 边界处理的标准模式：
+    用 if 保护计算，用 __syncthreads() 在 if 外同步，
+    越界线程"陪跑"到每个同步点，保证 block 内不出现线程数不一致的等待。
+
+================================================================================

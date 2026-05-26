@@ -66,10 +66,11 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
   scalar_t *smemA = reinterpret_cast<scalar_t*>(smemBias + totalCol / 4);
 
 
+  scalar_t rowMean {};
+
 
   if (row < totalRow) {
     // 求均值
-    scalar_t rowMean {};
 
 #pragma Unroll URF
     //每个线程向量化加载
@@ -162,10 +163,13 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
     if (threadIDX % 32 == 0) {
       reduction[threadIdx.y][threadIDX / 32] = rowMean;
     }
+  }
 
-    // SMEM的同步可以放在这里，因为最后计算的时候才会用到
-    __syncthreads();
 
+  // SMEM的同步可以放在这里，因为最后计算的时候才会用到
+  __syncthreads();
+
+  if (row < totalRow) {
     // warp0二级规约，
     if (threadIDX < 32) {
       rowMean = threadIDX < warp0threadNum ? reduction[threadIdx.y][threadIDX]: static_cast<scalar_t>(0.f);
@@ -184,9 +188,14 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
       rowMean /= static_cast<scalar_t>(totalCol);
       reduction[threadIdx.y][threadIDX] = rowMean;
     }
+  }
 
-    __syncthreads();
 
+  __syncthreads();
+
+  scalar_t rowVar {};
+  scalar_t diff {};
+  if (row < totalRow) {
     rowMean = reduction[threadIdx.y][0];
     if (threadIDX == 0) {
       // mean[row] = rowMean;
@@ -194,8 +203,6 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
     }
 
     // 求均方差
-    scalar_t rowVar {};
-    scalar_t diff {};
 
 #pragma Unroll URF
     // 向量化加载
@@ -234,9 +241,11 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
     if (threadIDX % 32 == 0) {
       reduction[threadIdx.y][threadIDX / 32] = rowVar;
     }
+  }
 
-    __syncthreads();
+  __syncthreads();
 
+  if (row < totalRow) {
     // warp0树形规约
     if (threadIDX < 32) {
       rowVar = threadIDX < warp0threadNum ? reduction[threadIdx.y][threadIDX] : static_cast<scalar_t>(0.f);
@@ -260,9 +269,10 @@ __global__ void LayerNorm_kernel_double_warp_reduction_unroll_SMEM(const scalar_
       rowVar = static_cast<scalar_t>(rsqrtf(static_cast<float>(rowVar) + 1e-5f));
       reduction[threadIdx.y][threadIDX] = rowVar;
     }
+  }
 
-    __syncthreads();
-
+  __syncthreads();
+  if (row < totalRow) {
     rowVar = reduction[threadIdx.y][0];
 
     if (threadIDX == 0) {
