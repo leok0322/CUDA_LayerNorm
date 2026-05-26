@@ -36,3 +36,6 @@ void  run_layernorm_forward_kernel_cg_warp_advanced(uint totalRow, uint totalCol
 
 void run_LayerNorm_kernel_warp_reduction_unroll_SMEM(uint totalRow, uint totalCol, float *A,
                 float *out, float* mean, float* rstd, float* weight, float* bias);
+
+void run_LayerNorm_kernel_double_warp_reduction_unroll_SMEM_advanced(uint totalRow, uint totalCol, float *A,
+                float *out, float* mean, float* rstd, float* weight, float* bias);
