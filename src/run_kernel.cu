@@ -8,7 +8,7 @@
 
 
 #ifndef LAYERNORM_VARIANT
-#define LAYERNORM_VARIANT 6
+#define LAYERNORM_VARIANT 11
 #endif
 
 
@@ -104,6 +104,7 @@ torch::Tensor LayerNorm_cu(torch::Tensor x) {
       }));
 
     #endif
+
     #if LAYERNORM_VARIANT == 6
       dim3 grid(1, cuda::ceil_div(totalRow,BLOCK_SIZE_Y_SMEM), 1);
       dim3 block(BLOCK_SIZE_X_SMEM, BLOCK_SIZE_Y_SMEM, 1);
@@ -211,6 +212,37 @@ torch::Tensor LayerNorm_cu(torch::Tensor x) {
 
         AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "LayerNorm_cu", ([&] {
           LayerNorm_kernel_warp_reduction_unroll_SMEM<scalar_t, float4, int64_t><<<grid, block, dynSmem,0>>>(totalRow,totalCol,x.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),mean.data_ptr<scalar_t>(),rstd.data_ptr<scalar_t>(),weight.data_ptr<scalar_t>(),bias.data_ptr<scalar_t>());
+          cudaCheck(cudaGetLastError());
+        }));
+    #endif
+
+    #if LAYERNORM_VARIANT == 11
+        dim3 grid(1, cuda::ceil_div(totalRow,BLOCK_SIZE_Y_SMEM), 1);
+        dim3 block(BLOCK_SIZE_X_SMEM, BLOCK_SIZE_Y_SMEM, 1);
+        assert(totalCol % 4 == 0 && "向量化加载不能完整覆盖所有列");
+
+        size_t dynSmem;
+        switch (x.scalar_type()) {
+          case at::ScalarType::Float: {
+            constexpr size_t static_smem = sizeof(float) * BLOCK_SIZE_Y_SMEM * 32;
+            // SMEM动态存储A的每一列元素和weight、bias以供复用，因为totalCol不是编译器常量，所以需要用动态smem
+            dynSmem  = sizeof(float)  * (totalCol / 4) * 5 *  (2 + BLOCK_SIZE_Y_SMEM);
+            constexpr size_t SM86_PER_BLOCK_MAX = 99 * 1024;
+            if (static_smem + dynSmem > SM86_PER_BLOCK_MAX) {
+              throw std::runtime_error(
+                  "[kernel6] dynSmem 超过 sm_86 per-block 上限 (99 KB)，请减小 totalCol 或 BLOCK_SIZE_Y_SMEM");
+            }
+            size_t maxDynamicDiff = static_smem + dynSmem < 48 * 1024 ? 48 * 1024 - (static_smem + dynSmem): 0;
+            size_t maxDynamic {dynSmem + maxDynamicDiff};
+            cudaCheck(cudaFuncSetAttribute(
+              (const void*)LayerNorm_kernel_double_warp_reduction_unroll_SMEM_advanced<float, float4, int64_t>,
+              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(maxDynamic)));
+            break;
+          }
+        }
+        AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "LayerNorm_cu", ([&] {
+          LayerNorm_kernel_double_warp_reduction_unroll_SMEM_advanced<scalar_t, float4, int64_t><<<grid, block, dynSmem,0>>>(totalRow,totalCol,x.data_ptr<scalar_t>(),
             out.data_ptr<scalar_t>(),mean.data_ptr<scalar_t>(),rstd.data_ptr<scalar_t>(),weight.data_ptr<scalar_t>(),bias.data_ptr<scalar_t>());
           cudaCheck(cudaGetLastError());
         }));
@@ -392,6 +424,38 @@ torch::Tensor LayerNorm_cu(torch::Tensor x) {
 
         AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "LayerNorm_cu", ([&] {
           LayerNorm_kernel_warp_reduction_unroll_SMEM<scalar_t, float4, int64_t><<<grid, block, dynSmem,0>>>(totalBatch * totalRow,totalCol,x.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),mean.data_ptr<scalar_t>(),rstd.data_ptr<scalar_t>(),weight.data_ptr<scalar_t>(),bias.data_ptr<scalar_t>());
+          cudaCheck(cudaGetLastError());
+        }));
+    #endif
+
+
+    #if LAYERNORM_VARIANT == 11
+        dim3 grid(1, cuda::ceil_div(totalBatch * totalRow,BLOCK_SIZE_Y_SMEM), 1);
+        dim3 block(BLOCK_SIZE_X_SMEM, BLOCK_SIZE_Y_SMEM, 1);
+        assert(totalCol % 4 == 0 && "向量化加载不能完整覆盖所有列");
+
+        size_t dynSmem;
+        switch (x.scalar_type()) {
+          case at::ScalarType::Float: {
+            constexpr size_t static_smem = sizeof(float) * BLOCK_SIZE_Y_SMEM * 32;
+            // SMEM动态存储A的每一列元素和weight、bias以供复用，因为totalCol不是编译器常量，所以需要用动态smem
+            dynSmem  = sizeof(float)  * (totalCol / 4) * 5 *  (2 + BLOCK_SIZE_Y_SMEM);
+            constexpr size_t SM86_PER_BLOCK_MAX = 99 * 1024;
+            if (static_smem + dynSmem > SM86_PER_BLOCK_MAX) {
+              throw std::runtime_error(
+                  "[kernel6] dynSmem 超过 sm_86 per-block 上限 (99 KB)，请减小 totalCol 或 BLOCK_SIZE_Y_SMEM");
+            }
+            size_t maxDynamicDiff = static_smem + dynSmem < 48 * 1024 ? 48 * 1024 - (static_smem + dynSmem): 0;
+            size_t maxDynamic {dynSmem + maxDynamicDiff};
+            cudaCheck(cudaFuncSetAttribute(
+              (const void*)LayerNorm_kernel_double_warp_reduction_unroll_SMEM_advanced<float, float4, int64_t>,
+              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(maxDynamic)));
+            break;
+          }
+        }
+        AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "LayerNorm_cu", ([&] {
+          LayerNorm_kernel_double_warp_reduction_unroll_SMEM_advanced<scalar_t, float4, int64_t><<<grid, block, dynSmem,0>>>(totalBatch * totalRow,totalCol,x.data_ptr<scalar_t>(),
             out.data_ptr<scalar_t>(),mean.data_ptr<scalar_t>(),rstd.data_ptr<scalar_t>(),weight.data_ptr<scalar_t>(),bias.data_ptr<scalar_t>());
           cudaCheck(cudaGetLastError());
         }));
