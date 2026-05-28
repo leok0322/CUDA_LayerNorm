@@ -1,0 +1,9 @@
+.idea/
+cmake-build-release/
+cmake-build-debug/
+benchmark_results/
+logs/
+autotune/
+
+
+.gitignore
